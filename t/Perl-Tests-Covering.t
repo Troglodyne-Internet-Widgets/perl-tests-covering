@@ -562,12 +562,12 @@ subtest 'tests_covering, with a map' => sub {
     foo_records( sub { covering( $twice, map => $map_saying->() )->tests_covering( ("$twice/templates/page.tt") x 2 ) } );
     is( scalar @asked, 1, 'even when it is named twice' );
 
-    is( $template->( foo_dist(), map => $map_saying->('lib/Foo.pm') ),                              [qw{t/a.t t/b.t t/c.t}],       'A file the map names stands in for it: its loaders cover it' );
-    is( $template->( foo_dist(), map => $map_saying->( 't/d.t', 'lib/Foo.pm' ) ),                   [qw{t/a.t t/b.t t/c.t t/d.t}], 'Tests and files together' );
-    is( $template->( foo_dist(), map => $map_saying->() ),                                          [],                            'A map with nothing to say, and unexplained none, chooses nothing' );
-    is( $template->( foo_dist(), map => $map_saying->(), unexplained => 'all' ),                    [qw{t/a.t t/b.t t/c.t t/d.t}], 'but with unexplained all, every test' );
-    is( $template->( foo_dist(), map => undef, unexplained => 'all' ),                              [qw{t/a.t t/b.t t/c.t t/d.t}], 'and so with no map at all' );
-    is( $template->( foo_dist(), map => $map_saying->('templates/page.tt'), unexplained => 'all' ), [],                            'A map says a file reaches no test by naming the file itself' );
+    is( $template->( foo_dist(), map => $map_saying->('lib/Foo.pm') ),                                          [qw{t/a.t t/b.t t/c.t}],       'A file the map names stands in for it: its loaders cover it' );
+    is( $template->( foo_dist(), map => $map_saying->( 't/d.t', 'lib/Foo.pm' ) ),                               [qw{t/a.t t/b.t t/c.t t/d.t}], 'Tests and files together' );
+    is( $template->( foo_dist(), map => $map_saying->() ),                                                      [],                            'A map with nothing to say, and unexplained none, chooses nothing' );
+    is( $template->( foo_dist(), map => $map_saying->(), unexplained => 'all' ),                                [qw{t/a.t t/b.t t/c.t t/d.t}], 'but with unexplained all, every test' );
+    is( $template->( foo_dist(), map => undef, unexplained => 'all' ),                                          [qw{t/a.t t/b.t t/c.t t/d.t}], 'and so with no map at all' );
+    is( $template->( foo_dist(), map => $map_saying->(Perl::Tests::Covering::NO_TESTS), unexplained => 'all' ), [],                            'A map says a file reaches no test with NO_TESTS' );
 
     my ( $got, $warned );
     $warned = warnings { $got = $template->( foo_dist(), map => $map_saying->( 't/nonexistent-bogus.t', '/bogus/abs' ), unexplained => 'all' ) };
@@ -653,6 +653,66 @@ subtest 'tests_covering_diff, with a map' => sub {
         [qw{t/a.t t/b.t t/c.t t/d.t}],
         'but any other new file is'
     );
+
+    # A new plugin, found by name at run time, and the template that comes
+    # with it: nothing in the diff uses the plugin.
+    my $plugin_diff = sub {
+        my ( $dir, @files ) = @_;
+        write_file( $dir, $_, "1;\n" ) for @files;
+        return join q{}, map { "diff --git a/$_ b/$_\nnew file mode 100644\nindex 0000000..1234567\n--- /dev/null\n+++ b/$_\n\@\@ -0,0 +1 \@\@\n+1;\n" } @files;
+    };
+    my $chosen_with = sub {
+        my ( $dir, $diff, %opts ) = @_;
+        return [
+            in_dir(
+                $dir,
+                sub {
+                    foo_records( sub { covering( $dir, unexplained => 'all', %opts )->tests_covering_diff($diff) } );
+                }
+            )
+        ];
+    };
+    my $plugins = sub {
+        my ($path) = @_;
+        return 'lib/Foo.pm'            if $path =~ m{\Alib/Foo/Plugin/.+[.]pm\z};
+        return 'lib/Foo/Plugin/New.pm' if $path =~ m{\Atemplates/plugin/New[.]tt\z};
+        return;
+    };
+
+    $root = foo_dist();
+    foo_records( sub { covering($root)->refresh() } );
+    $diff = $plugin_diff->( $root, 'lib/Foo/Plugin/New.pm' );
+    is( $chosen_with->( $root, $diff, map => $plugins ),       [qw{t/a.t t/b.t t/c.t}], 'An added Perl file is asked about, and its stand-in chooses its loaders' );
+    is( $chosen_with->( $root, $diff, map => sub { return } ), [],                      'An added Perl file the map says nothing about chooses nothing, even with unexplained all' );
+
+    my $got;
+    my $warned = warnings {
+        $got = $chosen_with->( $root, $diff, map => sub { return 'nonexistent-bogus.pm' } )
+    };
+    like( $warned, [qr/the map said 'nonexistent-bogus.pm'/], 'An added Perl file the map says something wrong about is warned about' );
+    is( $got, [qw{t/a.t t/b.t t/c.t t/d.t}], 'and is unexplained' );
+
+    $root = foo_dist();
+    foo_records( sub { covering($root)->refresh() } );
+    $diff = $plugin_diff->( $root, 'lib/Foo/Plugin/New.pm', 'templates/plugin/New.tt' );
+    is( $chosen_with->( $root, $diff, map => $plugins ), [qw{t/a.t t/b.t t/c.t t/d.t}], 'A stand-in that no test loads yet leaves its path unexplained, so every test runs' );
+};
+
+subtest 'NO_TESTS' => sub {
+    my $root = foo_dist();
+    write_file( $root, 'templates/page.tt', "[% page %]\n" );
+    my $asking = sub {
+        my (%opts) = @_;
+        return [ foo_records( sub { covering( $root, unexplained => 'all', %opts )->tests_covering("$root/templates/page.tt") } ) ];
+    };
+
+    is( Perl::Tests::Covering::NO_TESTS(), q{}, 'NO_TESTS is the empty string, which no path is' );
+    is( $asking->( map => sub { return Perl::Tests::Covering::NO_TESTS } ), [],                            'A path the map says reaches no test chooses none, even with unexplained all' );
+    is( $asking->( map => sub { return q{} } ),                             [],                            'and so does the empty string' );
+    is( $asking->( map => sub { return 'templates/page.tt' } ),             [qw{t/a.t t/b.t t/c.t t/d.t}], 'but the path itself is a stand-in that no test loads, and leaves it unexplained' );
+
+    write_file( $root, '.tests-covering-map.pl', "use Perl::Tests::Covering qw{NO_TESTS};\nsub { return NO_TESTS, 't/d.t' };\n" );
+    is( $asking->(), ['t/d.t'], 'A map file can import NO_TESTS, and return other paths after it' );
 };
 
 subtest _prune_cache => sub {

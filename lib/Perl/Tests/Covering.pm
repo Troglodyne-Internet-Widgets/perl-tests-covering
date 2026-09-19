@@ -33,6 +33,13 @@ use PPI                              ();
 use TAP::Parser::SourceHandler::Perl ();
 use Text::ParseWords                 ();
 
+use parent qw{Exporter};
+our @EXPORT_OK = qw{NO_TESTS};
+
+# What a map returns to say that a path reaches no test: the empty string,
+# which no path is.
+use constant NO_TESTS => q{};
+
 =head1 SYNOPSIS
 
     use Perl::Tests::Covering;
@@ -91,7 +98,8 @@ needs no id of its own.
 The exception is code that finds modules at run time without naming them, for
 example L<Module::Pluggable>.  A new plugin of that kind does not make a record
 stale.  Neither does a change to the environment, such as C<AUTHOR_TESTING>,
-that changes what a test runs.
+that changes what a test runs.  L</THE MAP> is how a distribution says which
+tests a new plugin reaches.
 
 =head2 A FILE THAT CHANGED OR IS GONE
 
@@ -170,9 +178,13 @@ reach such files, and the map is how it says so.
 The map is a code reference.  It is called once for each path in the question
 that is not a test and that no record names as loaded:
 
+    use Perl::Tests::Covering qw{NO_TESTS};
+
     sub {
         my ( $path, $change ) = @_;
-        return 't/templates.t' if $path =~ m{\Atemplates/};
+        return 't/templates.t'  if $path =~ m{\Atemplates/};
+        return 'lib/Plugins.pm' if $path =~ m{\Alib/Plugin/.+[.]pm\z};
+        return NO_TESTS         if $path =~ m{\Adocs/};
         return;
     }
 
@@ -197,19 +209,32 @@ is chosen, whatever lines the change touched;
 
 =item *
 
+C<NO_TESTS>, which says that C<$path> reaches no test;
+
+=item *
+
 nothing, which leaves C<$path> unexplained.
 
 =back
 
-To say that a path reaches no test, return the path itself, which no test
-loads.  A path that is neither a test nor a file under the root is dropped
-with a warning, so a mistake in the map leaves the path unexplained, and does
-not explain it away.
+C<NO_TESTS> is exported on request, and is the empty string, so a map can
+return C<q{}> instead.
 
-A path that the map leaves unexplained chooses no test, unless the
-C<unexplained> option is C<all>, which chooses every test.  In a diff, a Perl
-file that the diff adds is not unexplained: the files that use it are in the
-diff too.
+A path counts as explained when the map chooses a test for it, or says
+C<NO_TESTS>.  A stand-in that no test loads chooses nothing, so it leaves the
+path unexplained.  That happens when the stand-in is new, for example a
+plugin that comes in the same diff as its template.  A path that is neither a
+test nor a file under the root is dropped with a warning, so a mistake in the
+map leaves the path unexplained, and does not explain it away.
+
+A path that is unexplained chooses no test, unless the C<unexplained> option
+is C<all>, which chooses every test.
+
+A Perl file that a diff adds is asked about too, since code that finds modules
+at run time, such as L<Module::Pluggable>, loads it with nothing in the diff
+using it.  When the map says nothing about it, it counts as explained: the
+files that use it are usually in the diff, and a distribution without plugins
+does not run every test each time it adds a module.
 
 The map answers when the question is asked, so it adds nothing to the cache,
 and a change to it makes no record stale.
@@ -588,14 +613,14 @@ sub tests_covering_diff {
         $chosen{$test} = 1 if $in_diff{$test} || !$self->_record_holds( $record, \%in_diff ) || grep { $self->_change_reaches( $_, $record, $cache->{versions} ) } @changes;
     }
 
-    # A Perl file that is new in the diff is reached through the files that
-    # use it, which are in the diff too.
-    my %change_of;
+    # A Perl file that is new in the diff is usually reached through the files
+    # that use it, which are in the diff too, so the map's silence explains it.
+    my ( %change_of, %quiet );
     foreach my $change (@changes) {
-        next if !defined $change->{old} && defined $change->{new} && $self->_is_perl( $change->{new} );
         $change_of{$_} //= $change for grep { defined } @{$change}{qw{old new}};
+        $quiet{ $change->{new} } = 1 if !defined $change->{old} && defined $change->{new} && $self->_is_perl( $change->{new} );
     }
-    $chosen{$_} = 1 for $self->_unexplained_tests( [ sort keys %change_of ], [ $cache->{tests} ], \%change_of );
+    $chosen{$_} = 1 for $self->_unexplained_tests( [ sort keys %change_of ], [ $cache->{tests} ], \%change_of, \%quiet );
     return sort keys %chosen;
 }
 
@@ -660,42 +685,53 @@ sub _loaders {
 
 # The tests that the map, and then the unexplained option, choose for the
 # paths in @$paths that no test is and no record in @$records names.
-# $change_of holds the change from a diff for each path that has one.
+# $change_of holds the change from a diff for each path that has one.  A path
+# in %$quiet is explained when the map has nothing to say about it.
 sub _unexplained_tests {
-    my ( $self, $paths, $records, $change_of ) = @_;
+    my ( $self, $paths, $records, $change_of, $quiet ) = @_;
 
     my %tests = map { $_ => 1 } $self->tests();
     my ( %chosen, $unexplained );
     foreach my $path ( grep { !$tests{$_} && !_loaders( $_, @$records ) } List::Util::uniq(@$paths) ) {
-        my @said = $self->_ask_map( $path, $change_of->{$path}, \%tests );
-        $unexplained ||= !@said;
-        $chosen{$_} = 1 for grep { $tests{$_} } @said;
-        $chosen{$_} = 1 for map  { _loaders( $_, @$records ) } grep { !$tests{$_} } @said;
+        my $answer  = $self->_ask_map( $path, $change_of->{$path}, \%tests );
+        my @reached = ( @{ $answer->{tests} }, map { _loaders( $_, @$records ) } @{ $answer->{stand_ins} } );
+        $chosen{$_} = 1 for @reached;
+        $unexplained ||= !( @reached || $answer->{none} || ( $quiet->{$path} && !$answer->{said} ) );
     }
     return sort keys %tests if $unexplained && $self->{unexplained} eq 'all';
     return grep { $tests{$_} } sort keys %chosen;
 }
 
-# What the map says about one path: tests, and files that stand in for it,
-# relative to the root.  A path that is neither a test nor a file under the
-# root is dropped with a warning, so a mistake in the map leaves the path
-# unexplained rather than explained by nothing.
+# What the map says about one path, as a hash: tests and stand_ins, relative
+# to the root; none, when it said NO_TESTS; and said, when it returned
+# anything at all.  A path that is neither a test nor a file under the root is
+# dropped with a warning, so a mistake in the map leaves the path unexplained
+# rather than explained by nothing.
 sub _ask_map {
     my ( $self, $path, $change, $tests ) = @_;
 
-    my $map  = $self->{map} or return;
-    my @said = $self->_in_root( sub { $map->( $path, $change ) } );
+    my %answer = ( tests => [], stand_ins => [], none => 0, said => 0 );
+    my $map    = $self->{map} or return \%answer;
+    my @said   = $self->_in_root( sub { $map->( $path, $change ) } );
+    $answer{said} = @said;
 
-    my @kept;
     foreach my $said (@said) {
-        my $rel = defined $said ? $self->_relative( $said, $self->{root} ) : undef;
-        if ( defined $rel && ( $tests->{$rel} || ( -e File::Spec->catfile( $self->{root}, $rel ) && !-d _ ) ) ) {
-            push @kept, $rel;
+        if ( defined $said && $said eq NO_TESTS ) {
+            $answer{none} = 1;
             next;
         }
-        warn "tests-covering: the map said '${\( $said // 'undef' )}' for $path, which is neither a test nor a file under the root\n";
+        my $rel = defined $said ? $self->_relative( $said, $self->{root} ) : undef;
+        if ( defined $rel && $tests->{$rel} ) {
+            push @{ $answer{tests} }, $rel;
+        }
+        elsif ( defined $rel && -e File::Spec->catfile( $self->{root}, $rel ) && !-d _ ) {
+            push @{ $answer{stand_ins} }, $rel;
+        }
+        else {
+            warn "tests-covering: the map said '${\( $said // 'undef' )}' for $path, which is neither a test nor a file under the root\n";
+        }
     }
-    return @kept;
+    return \%answer;
 }
 
 # The code reference a map option names, or undef for none.  A file is run

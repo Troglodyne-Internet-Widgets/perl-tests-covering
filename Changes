@@ -9,6 +9,15 @@ Revision history for Perl-Tests-Covering
       neither a record nor the map explains runs every test.
     - The blocks of a parsed diff carry the text of their lines, for a map
       to read.
+    - A map says that a path reaches no test by returning NO_TESTS, which
+      Perl::Tests::Covering exports on request.  Returning the path itself,
+      as the map documentation said before, now makes it a stand-in that
+      no test loads, which leaves the path unexplained.  (GH #2)
+    - A stand-in that no test loads no longer explains a path, so
+      --unexplained all runs every test for it.  (GH #2)
+    - The map is asked about a Perl file that a diff adds, for code that
+      finds modules at run time.  When it says nothing, the file counts as
+      explained, as before.  (GH #2)
 
 0.001 2026-09-19 TEODESIAN
     - Initial Release.  Perl::Tests::Covering says which tests of a

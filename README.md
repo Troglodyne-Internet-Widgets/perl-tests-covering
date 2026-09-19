@@ -68,7 +68,8 @@ needs no id of its own.
 The exception is code that finds modules at run time without naming them, for
 example [Module::Pluggable](https://metacpan.org/pod/Module%3A%3APluggable).  A new plugin of that kind does not make a record
 stale.  Neither does a change to the environment, such as `AUTHOR_TESTING`,
-that changes what a test runs.
+that changes what a test runs.  ["THE MAP"](#the-map) is how a distribution says which
+tests a new plugin reaches.
 
 ## A FILE THAT CHANGED OR IS GONE
 
@@ -130,9 +131,13 @@ The map is a code reference.  It is called once for each path in the question
 that is not a test and that no record names as loaded:
 
 ```perl
+use Perl::Tests::Covering qw{NO_TESTS};
+
 sub {
     my ( $path, $change ) = @_;
-    return 't/templates.t' if $path =~ m{\Atemplates/};
+    return 't/templates.t'  if $path =~ m{\Atemplates/};
+    return 'lib/Plugins.pm' if $path =~ m{\Alib/Plugin/.+[.]pm\z};
+    return NO_TESTS         if $path =~ m{\Adocs/};
     return;
 }
 ```
@@ -148,17 +153,27 @@ It returns paths relative to the root:
 - a test, which is chosen;
 - any other file, which stands in for `$path`: each test that loaded that file
 is chosen, whatever lines the change touched;
+- `NO_TESTS`, which says that `$path` reaches no test;
 - nothing, which leaves `$path` unexplained.
 
-To say that a path reaches no test, return the path itself, which no test
-loads.  A path that is neither a test nor a file under the root is dropped
-with a warning, so a mistake in the map leaves the path unexplained, and does
-not explain it away.
+`NO_TESTS` is exported on request, and is the empty string, so a map can
+return `q{}` instead.
 
-A path that the map leaves unexplained chooses no test, unless the
-`unexplained` option is `all`, which chooses every test.  In a diff, a Perl
-file that the diff adds is not unexplained: the files that use it are in the
-diff too.
+A path counts as explained when the map chooses a test for it, or says
+`NO_TESTS`.  A stand-in that no test loads chooses nothing, so it leaves the
+path unexplained.  That happens when the stand-in is new, for example a
+plugin that comes in the same diff as its template.  A path that is neither a
+test nor a file under the root is dropped with a warning, so a mistake in the
+map leaves the path unexplained, and does not explain it away.
+
+A path that is unexplained chooses no test, unless the `unexplained` option
+is `all`, which chooses every test.
+
+A Perl file that a diff adds is asked about too, since code that finds modules
+at run time, such as [Module::Pluggable](https://metacpan.org/pod/Module%3A%3APluggable), loads it with nothing in the diff
+using it.  When the map says nothing about it, it counts as explained: the
+files that use it are usually in the diff, and a distribution without plugins
+does not run every test each time it adds a module.
 
 The map answers when the question is asked, so it adds nothing to the cache,
 and a change to it makes no record stale.
