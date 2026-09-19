@@ -25,7 +25,8 @@ C<%INC> it would see without it.
 =cut
 
 END {
-    my $dir = $ENV{PERL_TESTS_COVERING_LOADED};
+    # Taken whole, which also untaints it for a test run under -T.
+    my ($dir) = ( $ENV{PERL_TESTS_COVERING_LOADED} // q{} ) =~ m/\A(.+)\z/saa;
     if ( defined $dir && open my $fh, '>>', "$dir/loaded.$$" ) {
         print {$fh} map { "$_\n" } grep { defined && index( $_, "\n" ) < 0 } $0, values %INC;
         close $fh;

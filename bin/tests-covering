@@ -3,7 +3,7 @@
 package Perl::Tests::Covering::Script;
 
 # PODNAME: tests-covering
-# ABSTRACT: Print the tests that cover the files you name.
+# ABSTRACT: Print the tests that cover the files, subs or changes you name.
 
 use 5.014;
 
@@ -15,6 +15,7 @@ use re '/aa';
 use Cwd          ();
 use File::Spec   ();
 use Getopt::Long ();
+use List::Util   ();
 use Pod::Usage   ();
 
 use Perl::Tests::Covering ();
@@ -23,6 +24,16 @@ use Perl::Tests::Covering ();
 
     tests-covering [options] FILE...
     git diff --cached --name-only --diff-filter=ACMRD | tests-covering
+    git diff --cached | tests-covering --diff
+    tests-covering --sub NAME FILE
+    tests-covering --by TEST...
+    tests-covering --refresh
+
+    Modes, of which you can give one:
+      --diff           read a diff from STDIN, and print the tests it could break
+      --sub NAME       print the tests that ran the sub NAME in FILE
+      --by             print the files that each TEST loaded
+      --refresh        run the stale tests under coverage, and print nothing
 
     Options:
       --root DIR       the distribution; default: found from the current directory
@@ -42,6 +53,15 @@ the current directory.
 Tests that are new, or that changed, or whose files changed, run first under
 L<Devel::Cover>, with their output discarded.  L<Perl::Tests::Covering> says
 what counts as covering and when a test runs again.
+
+With C<--diff>, it reads a unified diff from git on standard input and prints
+the tests whose runs reached the lines the diff changes.  It runs nothing
+first.  L<Perl::Tests::Covering/CHOOSING TESTS FOR A CHANGE> says how it
+decides, and when it falls back to every test that loads a file.
+
+With C<--sub>, it prints the tests that ran a statement of one sub.  With
+C<--by>, it prints the files each test you name loaded, which is the question
+turned around.  With C<--refresh>, it only brings the records up to date.
 
 It exits 0 when it printed an answer, which can be no tests at all, and 2 when
 the options are wrong.
@@ -67,6 +87,33 @@ The first commit after the hook is installed runs every test under coverage,
 which is slow.  Run C<tests-covering> once by hand beforehand, with C<--jobs>,
 to have that done when it suits you.
 
+=head1 HOOKS THAT CHOOSE BY HUNK
+
+This pair runs only the tests whose runs reached the lines a commit changes.
+The pre-commit hook reads the diff of what is staged:
+
+    #!/bin/sh
+    tests=$(git diff --cached --full-index | tests-covering --diff) || exit 1
+    [ -z "$tests" ] && exit 0
+    exec prove -l $tests
+
+A diff describes the files as they were before the change, so the records it
+is read against have to be of those files.  The post-commit hook, in
+F<.git/hooks/post-commit>, brings them up to the commit just made, in the
+background:
+
+    #!/bin/sh
+    tests-covering --refresh >/dev/null 2>&1 &
+
+Without it, a test whose records are older than the last commit is run
+whenever it loaded a file that changed since, and the choice gets coarser with
+each commit.  Run C<tests-covering --refresh> by hand to catch up.
+
+Choosing by hunk trusts that each changed file still compiles.  A syntax error
+in a sub that no test runs chooses no tests, and still breaks every test that
+loads the file.  Put C<perl -c> over the changed files in the pre-commit hook
+before the tests, if that matters to you.
+
 =cut
 
 exit main(@ARGV) if !caller;
@@ -85,11 +132,15 @@ sub main {
     my (@argv) = @_;
 
     my %opts = ( 'test-dir' => [], lib => [] );
-    Getopt::Long::GetOptionsFromArray( \@argv, \%opts, qw{root=s test-dir=s@ lib=s@ jobs=i cache-dir=s help} )
+    Getopt::Long::GetOptionsFromArray( \@argv, \%opts, qw{root=s test-dir=s@ lib=s@ jobs=i cache-dir=s diff sub=s by refresh help} )
       or return synopsis(2);
     return synopsis(0) if $opts{help};
 
-    my @files = @argv ? @argv : read_names( \*STDIN );
+    my @modes = grep { defined $opts{$_} } qw{diff sub by refresh};
+    return usage_error('Give one of --diff, --sub, --by and --refresh, not several') if @modes > 1;
+    my $mode = $modes[0] // 'files';
+    return usage_error("--$mode takes no files")       if @argv          && grep { $mode eq $_ } qw{diff refresh};
+    return usage_error('--sub takes exactly one file') if $mode eq 'sub' && @argv != 1;
 
     my $covering = Perl::Tests::Covering->new(
         ( defined $opts{root}        ? ( root      => $opts{root} )        : () ),
@@ -99,9 +150,22 @@ sub main {
         ( defined $opts{'cache-dir'} ? ( cache_dir => $opts{'cache-dir'} ) : () ),
     );
 
+    my @names     = @argv || $mode eq 'refresh' || $mode eq 'diff' ? @argv : read_names( \*STDIN );
+    my %answer_to = (
+        files => sub { $covering->tests_covering(@names) },
+        diff  => sub {
+            $covering->tests_covering_diff( do { local $/ = undef; <STDIN> } );
+        },
+        sub => sub { $covering->tests_covering_sub( $names[0], $opts{sub} ) },
+        by  => sub {
+            List::Util::uniq( map { $covering->files_covered_by($_) } @names );
+        },
+        refresh => sub { $covering->refresh(); () },
+    );
+
     my $cwd = Cwd::getcwd();
-    foreach my $test ( $covering->tests_covering(@files) ) {
-        say File::Spec->abs2rel( File::Spec->catfile( $covering->root(), $test ), $cwd );
+    foreach my $file ( $answer_to{$mode}->() ) {
+        say File::Spec->abs2rel( File::Spec->catfile( $covering->root(), $file ), $cwd );
     }
     return 0;
 }
@@ -115,6 +179,19 @@ The file names in a handle, one per line, without blank lines.
 sub read_names {
     my ($fh) = @_;
     return grep { length } map { s/\r?\n\z//r } <$fh>;
+}
+
+=head2 usage_error
+
+Says what is wrong with the options on standard error, then does what
+L</synopsis> does with exit code 2.
+
+=cut
+
+sub usage_error {
+    my ($message) = @_;
+    warn "tests-covering: $message\n";
+    return synopsis(2);
 }
 
 =head2 synopsis

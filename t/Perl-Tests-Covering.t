@@ -28,21 +28,29 @@ use Test2::V1 -i;                 ## no critic (ProhibitUnusedImports)
 use Test2::Plugin::NoWarnings;    ## no critic (ProhibitUnusedImports)
 use Test2::Tools::Exception qw{dies lives};
 use Test::MockModule        qw{strict};
+use Config                  ();
 use Cwd                     ();
-use Digest::SHA             ();
 use File::Path              qw{make_path};
+use File::Slurper           ();
 use File::Spec              ();
 use File::Temp              qw{tempdir};
 use IO::Compress::Gzip      ();
+use Readonly;
 
 use FindBin::libs;
 
+use FakeDiff  qw{change_lines git_blob};
 use WriteFile qw{write_file};
 
 use Perl::Tests::Covering ();
 
 # What each test loads, besides itself, as the mocked coverage run reports it.
 our %LOADS;
+
+# The lines of each file that each test runs, and the lines of each file that
+# Devel::Cover counts a statement on.  A file with no entry in %STATEMENTS has
+# no lines in the record, as when Devel::Cover did not see it.
+our ( %EXECUTED, %STATEMENTS );
 
 # The tests the mocked coverage run was asked to run, in order.
 our @RAN;
@@ -52,17 +60,28 @@ $mock->redefine(
     _run_tests => sub {
         my ( $self, @tests ) = @_;
         push @RAN, @tests;
-        return {
-            map {
-                $_ => { loaded => { map { $_ => sha1_of( $self->root(), $_ ) } grep { -e File::Spec->catfile( $self->root(), $_ ) } $_, @{ $LOADS{$_} // [] } } }
-            } @tests
-        };
+        return { map { $_ => fake_record( $self->root(), $_ ) } @tests };
     }
 );
 
+# The record a run of $test would leave, from %LOADS, %EXECUTED and %STATEMENTS.
+sub fake_record {
+    my ( $root, $test ) = @_;
+
+    my %record = ( loaded => {}, executed => {}, versions => {} );
+    foreach my $rel ( grep { -e File::Spec->catfile( $root, $_ ) } $test, @{ $LOADS{$test} // [] } ) {
+        my $content = File::Slurper::read_binary( File::Spec->catfile( $root, $rel ) );
+        my $blob    = $record{loaded}{$rel} = git_blob($content);
+        next if !$STATEMENTS{$rel};
+        $record{executed}{$rel}  = $EXECUTED{$test}{$rel} // [];
+        $record{versions}{$blob} = { %{ Perl::Tests::Covering::_layout($content) }, statements => $STATEMENTS{$rel} };
+    }
+    return \%record;
+}
+
 sub sha1_of {
     my ( $root, $rel ) = @_;
-    return Digest::SHA->new(1)->addfile( File::Spec->catfile( $root, $rel ), 'b' )->hexdigest();
+    return git_blob( File::Slurper::read_binary( File::Spec->catfile( $root, $rel ) ) );
 }
 
 # A distribution: two modules, a script, and three tests.
@@ -228,6 +247,269 @@ subtest 'tests_covering the deletion of a module' => sub {
     is( [ covering($root)->tests_covering("$root/lib/Foo.pm") ], [qw{t/a.t t/b.t}], 'A deleted module is covered by the tests that loaded it, which are the ones it breaks' );
 };
 
+# A module whose lines each test runs are known, and four tests of it: a.t
+# runs sub a, b.t runs sub b, c.t only loads it and d.t does not.
+Readonly::Scalar my $FOO => <<'END_FOO';
+package Foo;
+use strict;
+
+our %S = (
+    x => 1,
+);
+
+# Adds one.
+sub a {
+    my ($n) = @_;
+    my %h = (
+        k => 1,
+    );
+    if ( $n > 0 ) {
+        return $n + 1;
+    }
+    return 0;
+}
+
+sub b {
+    return 2;
+}
+
+=head1 NAME
+
+Foo
+
+=cut
+
+1;
+END_FOO
+
+sub foo_dist {
+    my $root = dist();
+    write_file( $root, 'lib/Foo.pm', $FOO );
+    write_file( $root, "t/$_.t",     "1;\n" ) for qw{a b c d};
+    unlink "$root/t/deeper/c.t" or die $!;
+    return $root;
+}
+
+# Runs $code with the loads and lines of the tests of foo_dist.
+sub foo_records {
+    my ($code) = @_;
+    local %LOADS      = ( 't/a.t'      => ['lib/Foo.pm'], 't/b.t' => ['lib/Foo.pm'], 't/c.t' => ['lib/Foo.pm'], 't/d.t' => [] );
+    local %STATEMENTS = ( 'lib/Foo.pm' => [ 2, 10, 11, 14, 15, 17, 21 ] );
+    local %EXECUTED   = (
+        't/a.t' => { 'lib/Foo.pm' => [ 2, 10, 11, 14, 15 ] },
+        't/b.t' => { 'lib/Foo.pm' => [ 2, 21 ] },
+        't/c.t' => { 'lib/Foo.pm' => [2] },
+    );
+    return $code->();
+}
+
+subtest _parse_diff => sub {
+    my ($change) = Perl::Tests::Covering::_parse_diff(<<'DIFF');
+diff --git a/lib/Foo.pm b/lib/Foo.pm
+index 1234567..89abcde 100644
+--- a/lib/Foo.pm
++++ b/lib/Foo.pm
+@@ -3,2 +3,3 @@ sub a {
+ context
+-old four
++new four
++new five
+@@ -10,0 +12,1 @@
++added before old eleven
+@@ -20 +21,0 @@
+--- a line that looks like a header, removed
+\ No newline at end of file
+DIFF
+    is( [ @{$change}{qw{old new old_blob new_blob hunks}} ], [qw{lib/Foo.pm lib/Foo.pm 1234567 89abcde 3}], 'Paths without a/ and b/, the blobs, and the hunks' );
+    is(
+        $change->{blocks},
+        [ { at => 4, deleted => [4], added => [ 4, 5 ] }, { at => 11, deleted => [], added => [12] }, { at => 20, deleted => [20], added => [] } ],
+        'A block replaced after context, code added where nothing was taken out, and a line taken out that reads like a header'
+    );
+
+    my @two = Perl::Tests::Covering::_parse_diff(<<'DIFF');
+diff --git a/lib/Old.pm b/lib/New.pm
+similarity index 100%
+rename from lib/Old.pm
+rename to lib/New.pm
+diff --git a/lib/Gone.pm b/lib/Gone.pm
+deleted file mode 100644
+index 1234567..0000000
+--- a/lib/Gone.pm
++++ /dev/null
+@@ -1 +0,0 @@
+-package Gone;
+diff --git "a/lib/Tab\there.pm" "b/lib/Tab\there.pm"
+--- "a/lib/Tab\there.pm"
++++ "b/lib/Tab\there.pm"
+DIFF
+    is(
+        [ map { [ @{$_}{qw{old new}} ] } @two ],
+        [ [qw{lib/Old.pm lib/New.pm}], [ 'lib/Gone.pm', undef ], [ ("lib/Tab\there.pm") x 2 ] ],
+        'A rename, a deletion to /dev/null, and a quoted path'
+    );
+    ok( !$two[0]{hunks}, 'A rename with no changes has no hunks' );
+
+    my ($plain) = Perl::Tests::Covering::_parse_diff("--- lib/Foo.pm\t2026-01-01 00:00:00\n+++ lib/Foo.pm\t2026-01-02 00:00:00\n\@\@ -1 +1 \@\@\n-a\n+b\n");
+    is( [ @{$plain}{qw{old new}} ], [qw{lib/Foo.pm lib/Foo.pm}], 'A diff -u path keeps its directory and loses its date' );
+    ok( !defined $plain->{old_blob}, 'and has no blob' );
+
+    is( [ Perl::Tests::Covering::_parse_diff(q{}) ], [], 'An empty diff changes nothing' );
+};
+
+subtest _layout => sub {
+    my $layout = Perl::Tests::Covering::_layout($FOO);
+    ok( ( grep { $_->[0] == 9  && $_->[1] == 18 } @{ $layout->{spans} } ), 'sub a is one span, from its sub line to its brace' );
+    ok( ( grep { $_->[0] == 11 && $_->[1] == 13 } @{ $layout->{spans} } ), 'A statement over three lines is one span' );
+    ok( !( grep { $_->[0] == 12 } @{ $layout->{spans} } ), 'and what is inside its parentheses is not a statement of its own' );
+    is( $layout->{inert}, [ 3, 7, 8, 19, 23 .. 29 ], 'The blank lines, the comment and the POD are inert, and no code is' );
+
+    my $tricky = Perl::Tests::Covering::_layout( join "\n", 'my $x = <<EOT;', '# in a heredoc', q{}, 'EOT', 'my $y = "a', '# in a string', q{";}, q{} );
+    is( $tricky->{inert}, [], 'A heredoc body or a string that looks like a comment or a blank line is not inert' );
+    ok( ( grep { $_->[0] == 1 && $_->[1] == 4 } @{ $tricky->{spans} } ), 'A statement with a heredoc ends where the body does' );
+
+    is( Perl::Tests::Covering::_layout(undef), undef, 'No content, no layout' );
+};
+
+subtest _touches => sub {
+    my $version = { %{ Perl::Tests::Covering::_layout($FOO) }, statements => [ 2, 10, 11, 14, 15, 17, 21 ] };
+    my $runs_a  = [ 2, 10, 11, 14, 15 ];
+    my $touches = sub { Perl::Tests::Covering::_touches( $version, @_ ) };
+
+    ok( $touches->( $runs_a,    [15], [] ),   'A statement the test ran' );
+    ok( !$touches->( $runs_a,   [17], [] ),   'not a statement it did not run' );
+    ok( !$touches->( [ 2, 21 ], [15], [] ),   'nor one of a sub it did not call' );
+    ok( $touches->( $runs_a,    [12], [] ),   'The middle line of a statement it ran' );
+    ok( $touches->( $runs_a,    [16], [] ),   'The brace that closes an if block it ran' );
+    ok( $touches->( $runs_a,    [9],  [] ),   'The sub line of a sub it ran' );
+    ok( !$touches->( [ 2, 21 ], [9],  [] ),   'but not of a sub it did not' );
+    ok( $touches->( [2],        [5],  [] ),   'Code at the top of the file, which runs on loading, reaches a test that only loads it' );
+    ok( $touches->( [2],        [1],  [] ),   'So does the package line' );
+    ok( $touches->( [ 2, 21 ],  [],   [22] ), 'Code added inside sub b reaches a test that ran it' );
+    ok( !$touches->( $runs_a,   [],   [22] ), 'and not a test that did not' );
+    ok( $touches->( [2],        [],   [20] ), 'Code added between two subs reaches every test, as it runs on loading' );
+    ok( $touches->( undef,      [],   [] ),   'A test with no lines recorded is reached' );
+    ok( Perl::Tests::Covering::_touches( undef, $runs_a, [15], [] ), 'and so is one whose file has no layout' );
+};
+
+subtest tests_covering_diff => sub {
+    my $diff_of = sub {
+        my ( $root, @change ) = @_;
+        foo_records( sub { covering($root)->refresh() } );
+        return change_lines( $root, 'lib/Foo.pm', @change );
+    };
+    my $tests_for = sub {
+        my ( $root, $diff ) = @_;
+        local @RAN;
+        my @tests = in_dir(
+            $root,
+            sub {
+                foo_records( sub { covering($root)->tests_covering_diff($diff) } );
+            }
+        );
+        is( \@RAN, [], 'and runs nothing to find out' );
+        return \@tests;
+    };
+
+    my $root = foo_dist();
+    is( $tests_for->( $root, $diff_of->( $root, 15, 1, '        return $n + 2;' ) ), ['t/a.t'], 'A change to a line of sub a chooses the test that ran it' );
+
+    $root = foo_dist();
+    is( $tests_for->( $root, $diff_of->( $root, 21, 1, '    return 3;' ) ), ['t/b.t'], 'A change to sub b chooses the test that ran that' );
+
+    $root = foo_dist();
+    is( $tests_for->( $root, $diff_of->( $root, 17, 1, '    return -1;' ) ), [], 'A change to a line no test ran chooses none' );
+
+    $root = foo_dist();
+    is( $tests_for->( $root, $diff_of->( $root, 8, 1, '# Adds one to n.' ) ), [], 'A change to a comment chooses none' );
+
+    $root = foo_dist();
+    is( $tests_for->( $root, $diff_of->( $root, 26, 1, 'Foo, again' ) ), [], 'nor does one to POD' );
+
+    $root = foo_dist();
+    is( $tests_for->( $root, $diff_of->( $root, 5, 1, '    x => 2,' ) ), [qw{t/a.t t/b.t t/c.t}], 'A change to code at the top of the file chooses every test that loads it' );
+
+    $root = foo_dist();
+    is( $tests_for->( $root, $diff_of->( $root, 8, 1, 'foo();' ) ), [qw{t/a.t t/b.t t/c.t}], 'So does code put in place of a comment there' );
+
+    $root = foo_dist();
+    is( $tests_for->( $root, $diff_of->( $root, 20, 0, '# A comment.' ) ), [], 'A comment added between subs chooses none' );
+
+    $root = foo_dist();
+    my $diff = $diff_of->( $root, 20, 0, '# A comment.' );
+    write_file( $root, 'lib/Foo.pm', "$FOO\n" );
+    is( $tests_for->( $root, $diff ), [qw{t/a.t t/b.t t/c.t}], 'but when the file is not what the diff made it, added lines count as code' );
+
+    $root = foo_dist();
+    $diff = $diff_of->( $root, 15, 1, '        return $n + 2;' );
+    write_file( $root, 't/d.t', "2;\n" );
+    is( $tests_for->( $root, $diff ), [qw{t/a.t t/d.t}], 'A test that changed since its record, though not in the diff, is chosen as well' );
+
+    $root = foo_dist();
+    $diff = $diff_of->( $root, 15, 1, '        return $n + 2;' );
+    write_file( $root, 't/e.t', "1;\n" );
+    is( $tests_for->( $root, $diff ), [qw{t/a.t t/e.t}], 'A test with no record is chosen' );
+
+    $root = foo_dist();
+    $diff = $diff_of->( $root, 15, 1, '        return $n + 2;' ) . change_lines( $root, 't/d.t', 1, 1, '2;' );
+    is( $tests_for->( $root, $diff ), [qw{t/a.t t/d.t}], 'A test in the diff is chosen' );
+
+    $root = foo_dist();
+    $diff = $diff_of->( $root, 15, 1, '        return $n + 2;' ) =~ s/index [0-9a-f]+/index 0123456/r;
+    is( $tests_for->( $root, $diff ), [qw{t/a.t t/b.t t/c.t}], 'When the old side is not the version recorded, every test that loaded the file is chosen' );
+
+    $root = foo_dist();
+    $diff = $diff_of->( $root, 15, 1, '        return $n + 2;' ) =~ s/^index .*\n//mr;
+    is( $tests_for->( $root, $diff ), [qw{t/a.t t/b.t t/c.t}], 'and so when the diff does not say' );
+
+    $root = foo_dist();
+    foo_records( sub { covering($root)->refresh() } );
+    rename "$root/lib/Foo.pm", "$root/lib/Moved.pm" or die $!;
+    is(
+        $tests_for->( $root, "diff --git a/lib/Foo.pm b/lib/Moved.pm\nsimilarity index 100%\nrename from lib/Foo.pm\nrename to lib/Moved.pm\n" ),
+        [qw{t/a.t t/b.t t/c.t}],
+        'Moving a file chooses every test that loaded it'
+    );
+
+    $root = foo_dist();
+    $diff = $diff_of->( $root, 1, 30 );
+    unlink "$root/lib/Foo.pm" or die $!;
+    is( $tests_for->( $root, $diff =~ s{\+\+\+ b/lib/Foo.pm}{+++ /dev/null}r ), [qw{t/a.t t/b.t t/c.t}], 'and so does deleting it' );
+
+    $root = foo_dist();
+    $diff = $diff_of->( $root, 15, 1, '        return $n + 2;' );
+    write_file( $root, 'lib/Foo.pm', $FOO );
+    is( $tests_for->( $root, $diff =~ s{lib/Foo.pm}{../elsewhere/Foo.pm}gr ), [], 'A file outside the root chooses none' );
+    is( $tests_for->( $root, q{} ),                                           [], 'nor does an empty diff' );
+};
+
+subtest tests_covering_sub => sub {
+    my $root = foo_dist();
+    my @for  = map {
+        my $name = $_;
+        [ foo_records( sub { covering($root)->tests_covering_sub( "$root/lib/Foo.pm", $name ) } ) ]
+    } qw{a b Foo::a};
+    is( \@for, [ ['t/a.t'], ['t/b.t'], ['t/a.t'] ], 'The tests that ran a sub, by its name with or without its package' );
+
+    like(
+        dies {
+            foo_records( sub { covering($root)->tests_covering_sub( "$root/lib/Foo.pm", 'nonexistent_bogus' ) } )
+        },
+        qr/No sub nonexistent_bogus in/,
+        'A sub that is not there is an error'
+    );
+    like( dies { covering($root)->tests_covering_sub( '/bogus/Foo.pm',    'a' ) }, qr/is not under/,                       'and so is a file outside the root' );
+    like( dies { covering($root)->tests_covering_sub( "$root/lib/Foo.pm", q{} ) }, qr/needs a file and the name of a sub/, 'and so is an empty name' );
+    like( dies { covering($root)->tests_covering_sub() }, qr/needs a file and the name of a sub/, 'and so is no arguments' );
+};
+
+subtest files_covered_by => sub {
+    my $root = foo_dist();
+    is( [ foo_records( sub { covering($root)->files_covered_by("$root/t/a.t") } ) ],  [qw{lib/Foo.pm t/a.t}], 'The files a test loaded, itself too' );
+    is( [ foo_records( sub { covering($root)->files_covered_by('/bogus/t/a.t') } ) ], [],                     'A test outside the root loaded nothing' );
+    like( dies { covering($root)->files_covered_by() }, qr/needs a test/, 'No test is an error' );
+};
+
 subtest _prune_cache => sub {
     my $root  = dist();
     my $cache = "$root/.cache-bogus";
@@ -244,6 +526,29 @@ subtest _prune_cache => sub {
     ok( !-e "$cache/$gone.json.gz",            'The cache of a root that is gone is removed' );
     ok( !-e "$cache/${\( 'b' x 40 )}.json.gz", 'A cache whose header cannot be read is removed' );
     ok( -e "$cache/somebody-elses",            'A file that is not a cache is left alone' );
+};
+
+subtest _taint_switches => sub {
+    my $root = dist();
+    write_file( $root, 't/taint.t', "#!/usr/bin/perl -wT\n1;\n" );
+    write_file( $root, 't/lower.t', "#! perl -t\n1;\n" );
+    write_file( $root, 't/plain.t', "#!/usr/bin/perl -w\n# -T in a comment\n1;\n" );
+
+    local $ENV{PERL5OPT} = q{-Mbogus::A -Mbogus::B='a b'};
+    is(
+        [ covering($root)->_taint_switches( 't/taint.t', [qw{/bogus/lib /bogus/own}], [qw{-MCover -MRecorder}] ) ],
+        [ qw{-T -I/bogus/lib -I/bogus/own -MCover -MRecorder -Mbogus::A}, '-Mbogus::B=a b' ],
+        'A -T test gets -T, then the libs as -I, then the modules, then PERL5OPT, which perl would otherwise ignore'
+    );
+    is( ( covering($root)->_taint_switches( 't/lower.t',             [],             [] ) )[0],       '-t', 'A -t test gets -t' );
+    is( [ covering($root)->_taint_switches( 't/plain.t',             ['/bogus/lib'], ['-MCover'] ) ], [],   'A test without taint on its #! line gets nothing, and reads the environment' );
+    is( [ covering($root)->_taint_switches( 't/nonexistent-bogus.t', [],             [] ) ],          [],   'A test that cannot be read gets nothing' );
+};
+
+subtest _split_path => sub {
+    my $sep = $Config::Config{path_sep};
+    is( [ Perl::Tests::Covering::_split_path("/bogus/a$sep$sep/bogus/b$sep") ], [qw{/bogus/a /bogus/b}], 'The directories of a list, without the empty ones' );
+    is( [ Perl::Tests::Covering::_split_path(undef) ],                          [],                      'and none of a list that is not set' );
 };
 
 subtest _cover_switch => sub {

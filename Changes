@@ -5,3 +5,9 @@ Revision history for Perl-Tests-Covering
       distribution load a given file, from records of Devel::Cover runs kept
       in a cache, and runs again only the tests whose records are stale.
       bin/tests-covering is the command line, meant for a pre-commit hook.
+    - Choose tests by the lines a diff changes, from the lines each test
+      ran and where PPI finds each statement: tests_covering_diff, and
+      tests-covering --diff.  Choose by sub with tests_covering_sub and
+      --sub, and turn the question around with files_covered_by and --by.
+    - Run a test with -T or -t on its #! line under taint, as prove does.
+    - Compare with Devel::CoverX::Covered in the POD.

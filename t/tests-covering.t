@@ -53,6 +53,13 @@ $mock->redefine(
     }
 );
 
+# What the other modes were asked, as [ method, arguments ].
+my @calls;
+$mock->redefine( tests_covering_diff => sub { shift; push @calls, [ diff => @_ ]; return 't/a.t' } );
+$mock->redefine( tests_covering_sub  => sub { shift; push @calls, [ sub  => @_ ]; return 't/a.t' } );
+$mock->redefine( files_covered_by    => sub { shift; push @calls, [ by   => @_ ]; return qw{lib/Foo.pm t/a.t} } );
+$mock->redefine( refresh             => sub { push @calls, ['refresh']; return 't/a.t' } );
+
 # main(@argv), with STDIN reading $stdin, run from $dir.  Returns the exit code,
 # what it printed and what it warned.
 sub run_main {
@@ -99,6 +106,44 @@ subtest main => sub {
     my ( $help, $help_out ) = run_main( $root, q{}, qw{--help} );
     is( $help, 0, '--help exits 0' );
     like( $help_out, qr/--cache-dir DIR/, 'and prints the options to STDOUT' );
+};
+
+subtest 'main, in each mode' => sub {
+    my $diff = "diff --git a/x b/x\n\n \n-old\n+new\n";
+
+    @calls = ();
+    my ( $code, $out ) = run_main( $root, $diff, '--diff' );
+    is( \@calls, [ [ diff => $diff ] ], '--diff hands STDIN over whole, blank lines too' );
+    is( $out,    "t/a.t\n",             'and prints the tests' );
+
+    @calls = ();
+    ( $code, $out ) = run_main( $root, q{}, qw{--sub up lib/Foo.pm} );
+    is( \@calls, [ [ sub => 'lib/Foo.pm', 'up' ] ], '--sub asks about the sub in the one file' );
+
+    @calls = ();
+    ( $code, $out ) = run_main( $root, q{}, qw{--by t/a.t t/b.t} );
+    is( \@calls, [ [ by => 't/a.t' ], [ by => 't/b.t' ] ], '--by asks about each test' );
+    is( $out,    "lib/Foo.pm\nt/a.t\n",                    'and prints each file once' );
+
+    @calls = ();
+    ( $code, $out ) = run_main( $root, "not read\n", '--refresh' );
+    is( \@calls, [ ['refresh'] ], '--refresh refreshes' );
+    is( $out,    q{},             'and prints nothing, not even the tests it ran' );
+
+    foreach my $case (
+        [ [qw{--diff --refresh}],     qr/Give one of/,              'Two modes' ],
+        [ [qw{--diff lib/Foo.pm}],    qr/--diff takes no files/,    '--diff with a file' ],
+        [ [qw{--refresh lib/Foo.pm}], qr/--refresh takes no files/, '--refresh with a file' ],
+        [ [qw{--sub up}],             qr/exactly one file/,         '--sub with no file' ],
+        [ [qw{--sub up a.pm b.pm}],   qr/exactly one file/,         '--sub with two' ],
+    ) {
+        my ( $argv, $says, $what ) = @$case;
+        @calls = ();
+        my ( $exit, $printed );
+        my $warned = warnings { ( $exit, $printed ) = run_main( $root, q{}, @$argv ) };
+        like( $warned, [$says], "$what is refused, and says why" );
+        is( [ $exit, $printed, \@calls ], [ 2, q{}, [] ], 'with exit 2, and without asking anything' );
+    }
 };
 
 subtest read_names => sub {

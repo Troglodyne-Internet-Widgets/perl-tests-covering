@@ -11,28 +11,43 @@ use re '/aa';
 
 use Readonly;
 
-use Carp                   ();
-use Config                 ();
-use Cwd                    ();
-use Cpanel::JSON::XS       ();
-use Devel::Cover::DB       ();
-use Digest::SHA            ();
-use File::Find             ();
-use File::Path             ();
-use File::Slurper          ();
-use File::Slurper::Temp    ();
-use File::Spec             ();
-use File::Temp             ();
-use IO::Compress::Gzip     ();
-use IO::Uncompress::Gunzip ();
-use POSIX                  ();
+use Carp                             ();
+use Config                           ();
+use Cwd                              ();
+use Cpanel::JSON::XS                 ();
+use Devel::Cover::DB                 ();
+use Devel::Cover::DB::IO             ();
+use Digest::MD5                      ();
+use Digest::SHA                      ();
+use File::Find                       ();
+use File::Path                       ();
+use File::Slurper                    ();
+use File::Slurper::Temp              ();
+use File::Spec                       ();
+use File::Temp                       ();
+use IO::Compress::Gzip               ();
+use IO::Uncompress::Gunzip           ();
+use List::Util                       ();
+use POSIX                            ();
+use PPI                              ();
+use TAP::Parser::SourceHandler::Perl ();
+use Text::ParseWords                 ();
 
 =head1 SYNOPSIS
 
     use Perl::Tests::Covering;
 
     my $covering = Perl::Tests::Covering->new( root => '/src/My-Dist' );
-    my @tests    = $covering->tests_covering('lib/My/Dist.pm');
+
+    # The tests that load a file.
+    my @tests = $covering->tests_covering('lib/My/Dist.pm');
+
+    # The tests that ran the lines a change touches.
+    my @chosen = $covering->tests_covering_diff( scalar `git diff --cached` );
+
+    # The tests that ran a sub, and the files a test loaded.
+    my @callers = $covering->tests_covering_sub( 'lib/My/Dist.pm', 'frobnicate' );
+    my @files   = $covering->files_covered_by('t/frobnicate.t');
 
 =head1 DESCRIPTION
 
@@ -45,9 +60,13 @@ file is answered from that record.  A test is run again only when the record
 for it is stale: when the test is new, or when the test or any file it loaded
 changed since the record was made.
 
-The answer is meant for a git pre-commit hook.  Hand it the files of a
-changeset, and run what comes back.  L<tests-covering> is the command line for
-it, and has the hook:
+It also records which lines of each file each test ran.  So it can answer at
+a finer grain: which tests ran a given sub, and which tests ran the lines that
+a diff changes.
+
+The answer is meant for a git pre-commit hook.  Hand it the files or the diff
+of a changeset, and run what comes back.  L<tests-covering> is the command
+line for it, and has the hooks:
 
     tests-covering lib/My/Dist.pm | xargs --no-run-if-empty prove -l
 
@@ -63,10 +82,11 @@ configuration file is not reported as covering that file.
 
 =head2 WHEN A RECORD GOES STALE
 
-A record holds the SHA-1 digest of each file the test loaded.  The record is
-stale when any of those digests changed, or when any of those files is gone.
-A test that loads a new module can only do so because a file it already
-loaded changed, so the new module needs no digest of its own.
+A record holds the git blob id of each file the test loaded, which is the
+SHA-1 that git gives the content.  The record is stale when any of those ids
+changed, or when any of those files is gone.  A test that loads a new module
+can only do so because a file it already loaded changed, so the new module
+needs no id of its own.
 
 The exception is code that finds modules at run time without naming them, for
 example L<Module::Pluggable>.  A new plugin of that kind does not make a record
@@ -80,6 +100,63 @@ that covered it before its records were brought up to date.  So a module that
 you deleted is still reported as covered by the tests that used it, which are
 the tests that the deletion breaks.
 
+=head2 CHOOSING TESTS FOR A CHANGE
+
+L</tests_covering_diff> chooses tests by the lines a diff changes.  The
+numbers in a diff are the lines of each file before the change.  So it reads
+the records as they are and runs nothing, and a record only helps when it was
+made of the file as the diff's C<index> line names it.  Bring the records up
+to date after each commit, with L</refresh>, and the next diff finds them.
+L<tests-covering> has a post-commit hook that does that.
+
+A test is chosen when any of these is true:
+
+=over 4
+
+=item *
+
+it has no record, or it is in the diff;
+
+=item *
+
+a file it loaded changed since its record, and the diff does not say how;
+
+=item *
+
+the diff deletes or moves a file it loaded, or changes the file without a
+hunk, such as its mode;
+
+=item *
+
+its record of a file in the diff is of another version than the diff's old
+side, or the diff has no C<index> line to say which;
+
+=item *
+
+it ran a line that the diff changes, or code the diff adds goes in among lines
+it ran.
+
+=back
+
+The last rule needs to know where each statement is, and PPI says that.  A
+changed line counts as run when the test ran the statement that holds it, so
+a change to the second line of a statement over three lines counts.  So does a
+change to the brace that closes a block the test ran.  Code added inside a sub
+counts as run by the tests that ran that sub.  Blank lines, comments and POD
+count for nothing, in the old version as the record has it, and in the new one
+when the file in the work tree is what the diff made it.  A string or a
+heredoc body that looks like a comment is still code.
+
+Some code runs whenever the file is loaded, and Devel::Cover does not count it
+in a module: the code at the top of the file, and a C<package> line.  A change
+there, or code added between two subs, chooses every test that loads the file.
+So does adding a whole sub, since a new C<import>, C<DESTROY> or method can
+change what code that never called it does.
+
+Choosing by line trusts that each changed file still compiles.  A syntax error
+in a sub that no test runs chooses no tests, and still breaks every test that
+loads the file.  L<tests-covering> says how to have the hook check that too.
+
 =head2 THE CACHE ON DISK
 
 The records of a distribution are one file of gzipped JSON, in
@@ -88,6 +165,11 @@ C<XDG_CACHE_HOME> is not set.  The file name is the SHA-1 of the root.  The
 root is also in the gzip header, so that the cache of a root which is gone can
 be removed without reading the whole file.  That removal happens each time a
 cache is written.
+
+Beside the records, the cache keeps the layout of each version of a file that
+a record names, keyed by blob id: the lines that Devel::Cover counts a
+statement on, where PPI finds each statement, and which lines are blank,
+comments or POD.
 
 The cache also records the stamp of this module's file, the version of perl,
 and the configured test and library directories.  If any of them changes, all
@@ -105,17 +187,76 @@ starts is covered too.
 
 L<Perl::Tests::Covering::Recorder> goes in C<PERL5OPT> as well, and writes
 down C<%INC> as each perl exits.  Devel::Cover does not record a module whose
-code is all at the top of the file, and the recorder does.  Standard input, output and error go to the null
-device.  A test that fails still has its coverage recorded, because the
-question is what it ran, not whether it passed.
+code is all at the top of the file, and the recorder does.
+
+A test with C<-T> or C<-t> on its C<#!> line runs with that switch, as
+C<prove> runs it.  Perl ignores C<PERL5LIB> and C<PERL5OPT> under taint, so
+for such a test they also go on the command line, as C<-I> and C<-M>
+switches.
+
+Standard input, output and error go to the null device.  A test that fails
+still has its coverage recorded, because the question is what it ran, not
+whether it passed.
 
 Each run writes to a temporary coverage database of its own, and the database
-is deleted after it is read.  Nothing is written to F<cover_db>.
+is deleted after it is read.  Nothing is written to F<cover_db>.  The lines a
+test ran are only kept for a file whose content, when the run is read, is what
+Devel::Cover counted.  A file that changed while the test ran has no lines in
+the record, and a question about its lines chooses the test.
+
+=head2 COMPARED WITH Devel::CoverX::Covered
+
+L<Devel::CoverX::Covered|https://metacpan.org/pod/Devel::CoverX::Covered> answers the same question from a F<cover_db> that you
+make yourself: you run the whole suite under Devel::Cover, then run C<covered
+runs> before C<cover> merges the runs away.  This comparison is of its release
+0.016, run on the same small distribution as this module.
+
+It does more in two ways.  It reports how often each sub ran, with C<covered
+subs>.  And it reads a F<cover_db> from any run of the suite, such as one in CI,
+and editors reach it through L<Devel::PerlySense|https://metacpan.org/pod/Devel::PerlySense> and vim-covered.  This
+module runs the tests itself.
+
+This module does more in four ways.
+
+=over 4
+
+=item *
+
+It keeps its answers current.  Devel::CoverX::Covered has no idea of a stale
+record.  After a test changes, it gives the old answer until the whole suite
+runs again under Devel::Cover, and a deleted test stays in its answers, as its
+own documentation says.  This module runs again only the tests whose files
+changed.
+
+=item *
+
+It reports the test.  Devel::CoverX::Covered takes each perl process as a test,
+by its C<$0>.  So when a test runs F<bin/foo> in a child perl, it reports
+F<bin/foo> as the test that covers the modules F<bin/foo> uses, and does not
+report the test.
+
+=item *
+
+It counts every file a test loads.  Devel::CoverX::Covered counts a file only
+when a named sub in it ran.  So it reports no test for a module that a test
+loads and never calls, for a module that is all code at the top of the file,
+for a script without subs, or for the test itself.
+
+=item *
+
+It chooses by the lines of a diff.  Devel::CoverX::Covered chooses by file or
+by sub, and lists choosing by line as not done.
+
+=back
+
+Both answer the question turned around, which files a test covers, and both
+choose by sub.  Devel::CoverX::Covered needs C<Moose>, C<DBD::SQLite>,
+C<DBIx::Simple>, C<SQL::Abstract>, C<Path::Class> and C<File::chdir>.
 
 =cut
 
 # Change it when what the cache holds changes shape.
-Readonly::Scalar my $CACHE_FORMAT => 1;
+Readonly::Scalar my $CACHE_FORMAT => 2;
 
 Readonly::Scalar my $CACHE_NAME => 'perl-tests-covering';
 
@@ -194,7 +335,7 @@ sub new {
         lib       => [ @{ $opts{lib}   // ['lib'] } ],
         jobs      => $jobs,
         cache_dir => $opts{cache_dir} // _default_cache_dir(),
-        digest    => {},
+        blob      => {},
     }, $class;
 }
 
@@ -239,27 +380,34 @@ L</tests_covering> calls this for you.
 sub refresh {
     my ($self) = @_;
 
-    # A file edited between two refreshes has a new digest.
-    $self->{digest} = {};
+    # A file edited between two refreshes has a new blob.
+    $self->{blob} = {};
 
-    my $before = $self->_read_cache();
+    my $cache  = $self->_read_cache();
+    my $before = $cache->{tests};
     my ( %after, @stale );
     foreach my $test ( $self->tests() ) {
-        if ( $self->_is_fresh( $before->{$test} ) ) {
+        if ( $self->_record_holds( $before->{$test}, {} ) ) {
             $after{$test} = $before->{$test};
             next;
         }
         push @stale, $test;
     }
 
-    my $ran = $self->_run_tests(@stale);
-    @after{ keys %$ran } = values %$ran;
+    my $ran      = $self->_run_tests(@stale);
+    my $versions = $cache->{versions};
+    foreach my $test ( keys %$ran ) {
+        my $new = delete $ran->{$test}{versions} // {};
+        @{$versions}{ keys %$new } = values %$new;
+        $after{$test} = $ran->{$test};
+    }
 
     my $changed = @stale || grep { !$after{$_} } keys %$before;
-    $self->_write_cache( \%after ) if $changed;
+    $self->_write_cache( \%after, $versions ) if $changed;
 
-    $self->{before} = $before;
-    $self->{after}  = \%after;
+    $self->{before}   = $before;
+    $self->{after}    = \%after;
+    $self->{versions} = $versions;
     return @stale;
 }
 
@@ -293,6 +441,89 @@ sub tests_covering {
 
     # A test that is gone covers nothing it could be run for.
     return sort grep { $self->{after}{$_} } keys %covering;
+}
+
+=head2 tests_covering_diff
+
+    my @tests = $covering->tests_covering_diff($diff);
+
+The tests that a change could break, relative to the root, sorted.  C<$diff>
+is the text of a unified diff from git, such as C<git diff --cached>.  Its
+paths are relative to the current directory, which for git is the top of the
+work tree.
+
+It does not run anything first.  The line numbers of a diff describe the files
+before the change, so the answer has to come from records made of those files.
+See L</CHOOSING TESTS FOR A CHANGE>, which also says when it runs a test that
+the change may not reach.
+
+=cut
+
+sub tests_covering_diff {
+    my ( $self, $diff ) = @_;
+
+    $self->{blob} = {};
+    my $cache   = $self->_read_cache();
+    my $cwd     = Cwd::getcwd();
+    my @changes = map { $self->_resolve_change( $_, $cwd ) } _parse_diff($diff);
+    my %in_diff = map { $_ => 1 } grep { defined } map { @{$_}{qw{old new}} } @changes;
+
+    my @tests;
+    foreach my $test ( $self->tests() ) {
+        my $record = $cache->{tests}{$test};
+        push @tests, $test if $in_diff{$test} || !$self->_record_holds( $record, \%in_diff ) || grep { $self->_change_reaches( $_, $record, $cache->{versions} ) } @changes;
+    }
+    return @tests;
+}
+
+=head2 tests_covering_sub
+
+    my @tests = $covering->tests_covering_sub( $file, $name );
+
+The tests that ran any statement of the sub C<$name> in C<$file>, relative to
+the root, sorted.  C<$name> matches with or without its package.  It calls
+L</refresh> first, and dies when C<$file> has no such sub.
+
+A test whose record has no lines for C<$file> is reported when it loaded the
+file at all, as L</tests_covering> would.
+
+=cut
+
+sub tests_covering_sub {
+    my ( $self, $file, $name ) = @_;
+
+    Carp::croak('tests_covering_sub needs a file and the name of a sub') if !defined $file || !defined $name || !length $name;
+    my $rel = $self->_relative( $file, Cwd::getcwd() ) // Carp::croak("$file is not under ${\ $self->root() }");
+    $self->refresh();
+
+    my $content = eval { File::Slurper::read_binary( File::Spec->catfile( $self->{root}, $rel ) ) } // Carp::croak("Cannot read $file: $@");
+    my @starts  = _sub_lines( $content, $name =~ s/\A.*:://r );
+    Carp::croak("No sub $name in $file") if !@starts;
+
+    my $blob = _git_blob($content);
+    return sort grep {
+        my $record = $self->{after}{$_};
+        defined $record->{loaded}{$rel} && _touches( $self->{versions}{$blob}, $record->{executed}{$rel}, \@starts, [] )
+    } keys %{ $self->{after} };
+}
+
+=head2 files_covered_by
+
+    my @files = $covering->files_covered_by($test);
+
+The files that C<$test> loaded, relative to the root, sorted: the reverse of
+L</tests_covering>.  It calls L</refresh> first.  A test that is not a test of
+the distribution covers nothing.
+
+=cut
+
+sub files_covered_by {
+    my ( $self, $test ) = @_;
+
+    Carp::croak('files_covered_by needs a test') if !defined $test;
+    my $rel = $self->_relative( $test, Cwd::getcwd() ) // return;
+    $self->refresh();
+    return sort keys %{ $self->{after}{$rel}{loaded} // {} };
 }
 
 # The nearest directory, from $dir upwards, that holds a distribution.
@@ -329,25 +560,38 @@ sub _relative {
     return $rel;
 }
 
-# The SHA-1 of a file relative to the root, or undef when it cannot be read.
-# Kept for the length of one refresh.
-sub _digest {
+# The git blob id of a file relative to the root, or undef when it cannot be
+# read.  Kept until the next refresh or diff.
+sub _blob {
     my ( $self, $rel ) = @_;
 
-    return $self->{digest}{$rel} if exists $self->{digest}{$rel};
-
-    my $path = File::Spec->catfile( $self->{root}, $rel );
-    my $sha  = -e $path && !-d _ && eval { Digest::SHA->new(1)->addfile( $path, 'b' )->hexdigest() };
-    return $self->{digest}{$rel} = $sha || undef;
+    return $self->{blob}{$rel} if exists $self->{blob}{$rel};
+    return $self->{blob}{$rel} = _git_blob( _read( File::Spec->catfile( $self->{root}, $rel ) ) );
 }
 
-# Whether a record was made from every file it names as that file is now.
-sub _is_fresh {
-    my ( $self, $record ) = @_;
+# The id git gives a file with this content, which is also what a diff from git
+# names it by.
+sub _git_blob {
+    my ($content) = @_;
+    return if !defined $content;
+    return Digest::SHA::sha1_hex( 'blob ' . length($content) . "\0" . $content );
+}
+
+# The bytes of a file, or undef when it is not a file that can be read.
+sub _read {
+    my ($path) = @_;
+    return if !-e $path || -d _;
+    return eval { File::Slurper::read_binary($path) };
+}
+
+# Whether a record can be used at all, and whether each file it names, other
+# than those in %$except, is as it was when the record was made.
+sub _record_holds {
+    my ( $self, $record, $except ) = @_;
 
     return if ref $record ne 'HASH' || ref $record->{loaded} ne 'HASH' || !%{ $record->{loaded} };
-    foreach my $file ( keys %{ $record->{loaded} } ) {
-        my $now = $self->_digest($file) // return;
+    foreach my $file ( grep { !$except->{$_} } keys %{ $record->{loaded} } ) {
+        my $now = $self->_blob($file) // return;
         return if $now ne $record->{loaded}{$file};
     }
     return 1;
@@ -384,6 +628,10 @@ sub _spawn {
     my $loaded = File::Spec->catdir( $tmp, 'loaded' );
     mkdir $loaded or Carp::croak("Cannot make $loaded: $!");
 
+    my @lib  = ( ( map { File::Spec->rel2abs( $_, $self->{root} ) } @{ $self->{lib} } ), _split_path( $ENV{PERL5LIB} ), $OWN_LIB );
+    my @opt  = ( $self->_cover_switch( File::Spec->catdir( $tmp, 'cover_db' ) ), '-MPerl::Tests::Covering::Recorder' );
+    my @perl = ( $^X, $self->_taint_switches( $test, \@lib, \@opt ), $test );
+
     my $pid = fork // Carp::croak("Cannot fork to run $test: $!");
     return $pid if $pid;
 
@@ -395,16 +643,41 @@ sub _spawn {
     open STDOUT, '>',  $null    or POSIX::_exit($EXEC_FAILED);
     open STDERR, '>&', \*STDOUT or POSIX::_exit($EXEC_FAILED);
 
-    my @lib = map { File::Spec->rel2abs( $_, $self->{root} ) } @{ $self->{lib} };
-    my $db  = File::Spec->catdir( $tmp, 'cover_db' );
-    $ENV{PERL5LIB}                   = join $Config::Config{path_sep}, @lib, grep( { defined && length } $ENV{PERL5LIB} ), $OWN_LIB;
-    $ENV{PERL5OPT}                   = join q{ }, $self->_cover_switch($db), '-MPerl::Tests::Covering::Recorder', grep { defined && length } $ENV{PERL5OPT};
+    # A perl that a tainted test starts is not tainted, and reads these.
+    $ENV{PERL5LIB}                   = join $Config::Config{path_sep}, @lib;
+    $ENV{PERL5OPT}                   = join q{ }, @opt, grep { defined && length } $ENV{PERL5OPT};
     $ENV{PERL_TESTS_COVERING_LOADED} = $loaded;
     $ENV{HARNESS_ACTIVE}             = 1;
 
     # A list exec of perl itself, with no shell in between.
-    { no warnings 'exec'; exec {$^X} $^X, $test }    ## no critic (ProhibitShellDispatch)
+    { no warnings 'exec'; exec {$^X} @perl }    ## no critic (ProhibitShellDispatch)
     POSIX::_exit($EXEC_FAILED);
+}
+
+# The switches that go before the test on perl's command line: none, unless its
+# #! line asks for taint.  Then they are the taint switch, and PERL5LIB and
+# PERL5OPT as switches, which is what prove does.
+sub _taint_switches {
+    my ( $self, $test, $lib, $opt ) = @_;
+
+    my $taint = TAP::Parser::SourceHandler::Perl->get_taint( _first_line( File::Spec->catfile( $self->{root}, $test ) ) ) // return;
+    return ( "-$taint", ( map { "-I$_" } @$lib ), @$opt, Text::ParseWords::shellwords( $ENV{PERL5OPT} // q{} ) );
+}
+
+# The first line of a file, or undef.
+sub _first_line {
+    my ($path) = @_;
+
+    open my $fh, '<', $path or return;
+    my $line = <$fh>;
+    close $fh;
+    return $line;
+}
+
+# The directories in a PATH-like list, without the empty ones.
+sub _split_path {
+    my ($list) = @_;
+    return grep { length } split m/\Q$Config::Config{path_sep}\E/, $list // q{};
 }
 
 # The -MDevel::Cover switch for one run.  Devel::Cover splits its options on
@@ -420,36 +693,67 @@ sub _cover_switch {
     return "-MDevel::Cover=-db,$db,-silent,1,-coverage,statement,-select,^(?!/)|^$root/";
 }
 
-# The record of one run: the digest of every file of the distribution that the
+# The record of one run: the blob of every file of the distribution that the
 # test loaded, by what Devel::Cover and the recorder say, and of the test
-# itself.
+# itself; the lines of each that ran; and under versions, the layout of each
+# file as it was, keyed by blob.
 sub _record {
     my ( $self, $test, $tmp ) = @_;
 
-    my %loaded = ( $test => 1 );
-    $loaded{$_} = 1 for $self->_files_covered( File::Spec->catdir( $tmp, 'cover_db', 'runs' ) );
-    $loaded{$_} = 1 for $self->_files_recorded( File::Spec->catdir( $tmp, 'loaded' ) );
+    my $covered = $self->_files_covered( File::Spec->catdir( $tmp, 'cover_db' ) );
+    my %loaded  = map { $_ => 1 } $test, keys %$covered, $self->_files_recorded( File::Spec->catdir( $tmp, 'loaded' ) );
 
-    my %digests = map { $_ => $self->_digest($_) } keys %loaded;
-    delete @digests{ grep { !defined $digests{$_} } keys %digests };
-    return { loaded => \%digests };
+    my %record = ( loaded => {}, executed => {}, versions => {} );
+    foreach my $rel ( keys %loaded ) {
+        my $content = _read( File::Spec->catfile( $self->{root}, $rel ) ) // next;
+        my $blob    = $record{loaded}{$rel} = _git_blob($content);
+
+        # Lines are only good for the content they were counted in, and the
+        # file may have changed while the test ran.
+        my $run    = $covered->{$rel}{ Digest::MD5::md5_hex($content) } or next;
+        my $layout = _layout($content)                                  or next;
+        $record{executed}{$rel}  = [ sort { $a <=> $b } keys %{ $run->{executed} } ];
+        $record{versions}{$blob} = { %$layout, statements => $run->{statements} };
+    }
+    return \%record;
 }
 
-# The files of the distribution in each run that Devel::Cover wrote.  It reads
-# the counts of each run as loaded, because the public runs() goes through
+# The files of the distribution that Devel::Cover saw in each run of one
+# database, keyed by file and then by Devel::Cover's digest of the content:
+# the lines that hold a statement, and those of them that ran.  It reads the
+# counts of each run as loaded, because the public runs() goes through
 # cover(), which also needs the working directory the run had.
 sub _files_covered {
-    my ( $self, $runs ) = @_;
+    my ( $self, $db ) = @_;
 
-    my @files;
-    foreach my $dir ( _entries($runs) ) {
-        my $db = eval { Devel::Cover::DB->new( db => $dir ) } or next;
-        foreach my $run ( grep { ref eq 'HASH' } values %{ $db->{runs} // {} } ) {
+    my %files;
+    foreach my $dir ( _entries( File::Spec->catdir( $db, 'runs' ) ) ) {
+        my $runs = eval { Devel::Cover::DB->new( db => $dir ) } or next;
+        foreach my $run ( grep { ref eq 'HASH' } values %{ $runs->{runs} // {} } ) {
             my $cwd = $run->{dir} // $self->{root};
-            push @files, map { $self->_distribution_file( $_, $cwd ) } keys %{ $run->{count} // {} };
+            foreach my $name ( keys %{ $run->{count} // {} } ) {
+                my $rel    = $self->_distribution_file( $name, $cwd ) // next;
+                my $digest = $run->{digests}{$name}                   // next;
+                my $lines  = _statement_lines( $db, $digest )         // next;
+                my $counts = $run->{count}{$name}{statement}          // [];
+
+                my $file = $files{$rel}{$digest} //= { statements => [ List::Util::uniqnum( sort { $a <=> $b } grep { defined } @$lines ) ], executed => {} };
+                $file->{executed}{ $lines->[$_] } = 1 for grep { $counts->[$_] && defined $lines->[$_] } 0 .. $#$counts;
+            }
         }
     }
-    return @files;
+    return \%files;
+}
+
+# The line of each statement in the file Devel::Cover knows by $digest, in the
+# order of its counts.  Read from its structure file directly, because
+# Devel::Cover::DB::Structure->read resolves the file against the working
+# directory and deletes the structure of a file that changed.
+sub _statement_lines {
+    my ( $db, $digest ) = @_;
+
+    my $structure = eval { Devel::Cover::DB::IO->new->read( File::Spec->catfile( $db, 'structure', $digest ) ) };
+    return ref $structure eq 'HASH' && ref $structure->{statement} eq 'ARRAY' ? $structure->{statement} : undef;
 }
 
 # The files of the distribution in each list that the recorder wrote.  A
@@ -462,7 +766,7 @@ sub _files_recorded {
     my @files;
     foreach my $list ( _entries($loaded) ) {
         my @names = eval { File::Slurper::read_lines($list) } or next;
-        push @files, map { $self->_distribution_file( $_, $self->{root} ) } @names;
+        push @files, grep { defined } map { $self->_distribution_file( $_, $self->{root} ) } @names;
     }
     return @files;
 }
@@ -487,7 +791,251 @@ sub _distribution_file {
     # A test run after `make` loads the copy in blib.
     $rel =~ s{\Ablib/(?:lib|arch)/}{lib/} or $rel =~ s{\Ablib/script/}{bin/};
     my $path = File::Spec->catfile( $self->{root}, $rel );
-    return -e $path && !-d _ ? $rel : ();
+    return -e $path && !-d _ ? $rel : undef;
+}
+
+# Each file a unified diff changes: its old and new paths as the diff names
+# them, or undef for /dev/null; the blob ids from its index line, which may be
+# abbreviated; and its blocks.  A block is a run of removed and added lines:
+# at is the old line it starts at, or that the added lines go in before when
+# nothing is removed; deleted holds old line numbers and added new ones.
+sub _parse_diff {
+    my ($diff) = @_;
+
+    # Where the parse is: the changes so far, and in the hunk being read, the
+    # next line on each side and how many are left.
+    my %at = ( changes => [], old_left => 0, new_left => 0 );
+    foreach my $line ( split m/\r?\n/, $diff // q{} ) {
+        if ( $at{old_left} || $at{new_left} ) {
+            _hunk_line( \%at, $line );
+            next;
+        }
+        _header_line( \%at, $line );
+    }
+    return @{ $at{changes} };
+}
+
+# One line of a hunk: removed, added, or the same on both sides.
+sub _hunk_line {
+    my ( $at, $line ) = @_;
+
+    my $mark = substr $line, 0, 1;
+    if ( $mark eq q{-} || $mark eq q{+} ) {
+        $at->{block} //= _new_block( $at->{changes}[-1], $at->{old} );
+        my $side = $mark eq q{-} ? 'old' : 'new';
+        push @{ $at->{block}{ $side eq 'old' ? 'deleted' : 'added' } }, $at->{$side}++;
+        $at->{"${side}_left"}--;
+        return;
+    }
+    return if $mark eq q{\\};
+
+    undef $at->{block};
+    $at->{$_}++ for qw{old new};
+    $at->{"${_}_left"}-- for qw{old new};
+    return;
+}
+
+# One line outside a hunk.
+sub _header_line {
+    my ( $at, $line ) = @_;
+
+    my $changes = $at->{changes};
+    if ( $line =~ m/\Adiff --git (\S+) (\S+)\z/ ) {
+        push @$changes, { git => 1, old => _diff_path( $1, 1 ), new => _diff_path( $2, 1 ), blocks => [] };
+        return;
+    }
+    if ( $line =~ m/\Adiff / || ( $line =~ m/\A--- / && ( !@$changes || @{ $changes->[-1]{blocks} } ) ) ) {
+        push @$changes, { blocks => [] };
+    }
+
+    my $change = $changes->[-1] or return;
+    if ( $line =~ m/\Aindex ([0-9a-f]+)[.][.]([0-9a-f]+)/ ) {
+        @{$change}{qw{old_blob new_blob}} = ( $1, $2 );
+    }
+    elsif ( my ( $moved, $marked, $path ) = $line =~ m/\A(?:(?:rename|copy) (from|to)|(---|[+]{3})) (.+)\z/ ) {
+        my $side = ( $moved // $marked ) =~ m/\A(?:from|---)\z/ ? 'old' : 'new';
+        $change->{$side} = _diff_path( $path, $marked && $change->{git} );
+    }
+    elsif ( $line =~ m/\A\@\@ -(\d+)(?:,(\d+))? [+](\d+)(?:,(\d+))? \@\@/ ) {
+        @{$at}{qw{old old_left new new_left}} = ( $1, $2 // 1, $3, $4 // 1 );
+
+        # An empty side is numbered by the line before it.
+        $at->{$_}++ for grep { !$at->{"${_}_left"} } qw{old new};
+        undef $at->{block};
+        $change->{hunks}++;
+    }
+    return;
+}
+
+sub _new_block {
+    my ( $change, $at ) = @_;
+    my $block = { at => $at, deleted => [], added => [] };
+    push @{ $change->{blocks} }, $block;
+    return $block;
+}
+
+# A path as a diff writes it, unquoted, without git's a/ or b/ in front when
+# $git, and without the date that diff -u puts after a tab.  Undef for
+# /dev/null.
+sub _diff_path {
+    my ( $path, $git ) = @_;
+
+    if ( $path =~ m/\A"(.*)"\z/s ) {
+        my %escape = ( n => "\n", t => "\t", q{"} => q{"}, q{\\} => q{\\} );
+        $path = $1 =~ s{\\([0-7]{3}|.)}{length $1 == 3 ? chr oct $1 : $escape{$1} // $1}gser;
+    }
+    else {
+        $path =~ s/\t.*\z//s;
+    }
+    return                    if $path eq '/dev/null';
+    $path =~ s{\A[abciow]/}{} if $git;
+    return $path;
+}
+
+# A change from _parse_diff with its paths relative to the root.  A path
+# outside the root is undef, like one that is not there.
+sub _resolve_change {
+    my ( $self, $change, $cwd ) = @_;
+
+    my %resolved = %$change;
+    $resolved{$_} = defined $change->{$_} ? $self->_relative( $change->{$_}, $cwd ) : undef for qw{old new};
+    return \%resolved;
+}
+
+# Whether a change could reach a test, going by the test's record and the
+# layouts of the files it loaded.  It reaches the test when it cannot tell.
+sub _change_reaches {
+    my ( $self, $change, $record, $versions ) = @_;
+
+    # A file that is new in the change was not loaded before it.
+    my $old  = $change->{old}          // return 0;
+    my $blob = $record->{loaded}{$old} // return 0;
+
+    # Every test that loaded a file breaks when it is deleted or moved.
+    return 1 if ( $change->{new} // q{} ) ne $old;
+    return 1 if !$change->{hunks} || !defined $change->{old_blob} || index( $blob, $change->{old_blob} ) != 0;
+    my $version = $versions->{$blob};
+    return 1 if !$version;
+
+    my %old_inert = map { $_ => 1 } @{ $version->{inert} };
+    my %new_inert = map { $_ => 1 } @{ $self->_new_inert($change) };
+    my ( @lines, @gaps );
+    foreach my $block ( @{ $change->{blocks} } ) {
+        my @code = grep { !$old_inert{$_} } @{ $block->{deleted} };
+        push @lines, @code;
+
+        # Code in place of nothing but comments, blank lines and POD goes in
+        # between the lines around it.
+        push @gaps, $block->{at} if !@code && grep { !$new_inert{$_} } @{ $block->{added} };
+    }
+    return _touches( $version, $record->{executed}{$old}, \@lines, \@gaps );
+}
+
+# The inert lines of the new side of a change, when the file in the work tree
+# is that new side.  Otherwise none, and every added line counts as code.
+sub _new_inert {
+    my ( $self, $change ) = @_;
+
+    my $new = $change->{new} // return [];
+    return [] if !defined $change->{new_blob} || index( $self->_blob($new) // q{}, $change->{new_blob} ) != 0;
+    my $layout = _layout( _read( File::Spec->catfile( $self->{root}, $new ) ) ) or return [];
+    return $layout->{inert};
+}
+
+# Whether a test that ran @$executed of the lines of a file, in the version
+# that $version describes, could be affected by a change to @$lines, or by
+# code added before each of @$gaps.  A changed line is judged by the innermost
+# statement that holds it: by its first line when Devel::Cover counted a
+# statement there, and otherwise by any statement inside it.  Added code is
+# judged by the innermost statement around it.  When there is no such
+# statement, or no statement inside it was counted, the answer is yes: that is
+# code which runs when the file is loaded, or code nothing measured.
+sub _touches {
+    my ( $version, $executed, $lines, $gaps ) = @_;
+
+    return 1 if ref $version ne 'HASH' || ref $executed ne 'ARRAY';
+    my %ran   = map { $_ => 1 } @$executed;
+    my %known = map { $_ => 1 } @{ $version->{statements} };
+
+    foreach my $range ( ( map { [ $_, $_, 0 ] } @$lines ), ( map { [ $_ - 1, $_, 1 ] } @$gaps ) ) {
+        my ( $from, $to, $is_gap ) = @$range;
+        my $span     = _innermost( $version->{spans}, $from, $to ) or return 1;
+        my @measured = !$is_gap && $known{ $span->[0] } ? ( $span->[0] ) : grep { $known{$_} } $span->[0] .. $span->[1];
+        return 1 if !@measured || grep { $ran{$_} } @measured;
+    }
+    return 0;
+}
+
+# The innermost span that holds every line from $from to $to, or undef.
+sub _innermost {
+    my ( $spans, $from, $to ) = @_;
+
+    my $best;
+    foreach my $span ( grep { $_->[0] <= $from && $_->[1] >= $to } @$spans ) {
+        $best = $span if !$best || $span->[0] > $best->[0] || ( $span->[0] == $best->[0] && $span->[1] < $best->[1] );
+    }
+    return $best;
+}
+
+# Where the statements of some perl are, as [ first line, last line ], and
+# which lines are inert: blank, a comment and nothing else, or POD.  Undef
+# when PPI cannot read it.  A statement with a heredoc ends where the last of
+# its bodies does.  A line of a string or of a heredoc body is never inert,
+# since changing it changes what the code does.
+sub _layout {
+    my ($content) = @_;
+
+    my $doc   = _ppi($content) or return;
+    my @lines = split qq{\n}, $content, -1;
+
+    # What PPI calls a statement inside parentheses or brackets is part of the
+    # statement around it, and Devel::Cover counts that one.
+    my @statements = grep { my $parent = $_->parent(); !$parent->isa('PPI::Structure') || $parent->isa('PPI::Structure::Block') } @{ $doc->find('PPI::Statement') || [] };
+
+    my @spans;
+    foreach my $statement (@statements) {
+        my $end = _last_line( $statement->last_token() );
+        foreach my $heredoc ( @{ $statement->find('PPI::Token::HereDoc') || [] } ) {
+            my @body = $heredoc->heredoc();
+            $end = List::Util::max( $end, $heredoc->line_number() + @body + 1 );
+        }
+        push @spans, [ $statement->first_token()->line_number(), $end ];
+    }
+
+    my %inert;
+    foreach my $token ( $doc->tokens() ) {
+        my @span = ( $token->line_number() .. _last_line($token) );
+        if ( $token->isa('PPI::Token::Pod') ) {
+            $inert{$_} = 1 for @span;
+        }
+        elsif ( $token->isa('PPI::Token::Whitespace') || $token->isa('PPI::Token::Comment') ) {
+            $inert{$_} = 1 for grep { ( $lines[ $_ - 1 ] // q{} ) =~ m/\A\s*(?:#.*)?\z/ } @span;
+        }
+    }
+    return { spans => \@spans, inert => [ sort { $a <=> $b } keys %inert ] };
+}
+
+# The first line of each sub named $name, in any package, in some perl.
+sub _sub_lines {
+    my ( $content, $name ) = @_;
+
+    my $doc = _ppi($content) or return;
+    return map { $_->line_number() } grep { ( $_->name() // q{} ) =~ m/\A(?:.*::)?\Q$name\E\z/ } @{ $doc->find('PPI::Statement::Sub') || [] };
+}
+
+sub _ppi {
+    my ($content) = @_;
+    return if !defined $content;
+    my $doc = PPI::Document->new( \$content ) or return;
+    $doc->index_locations();
+    return $doc;
+}
+
+# The last line a token is on.
+sub _last_line {
+    my ($token) = @_;
+    my $content = $token->content();
+    return $token->line_number() + ( $content =~ tr/\n// ) - ( $content =~ m/\n\z/ ? 1 : 0 );
 }
 
 sub _cache_path {
@@ -505,7 +1053,9 @@ sub _cache_key {
     return join q{/}, $CACHE_FORMAT, join( q{:}, @st[ 0, 1, 7, 9 ] ), $^X, $], join( q{,}, @{ $self->{tests} } ), join( q{,}, @{ $self->{lib} } );
 }
 
-# The records in the cache, keyed by test, or an empty hash.
+# The records in the cache, under tests and keyed by test, and the layouts of
+# the files they name, under versions and keyed by blob.  Both are empty when
+# there is no cache to use.
 sub _read_cache {
     my ($self) = @_;
 
@@ -517,16 +1067,18 @@ sub _read_cache {
         IO::Uncompress::Gunzip::gunzip( \$gz => \my $json ) or return;
         Cpanel::JSON::XS->new->decode($json);
     };
-    return {} if ref $cache ne 'HASH' || ( $cache->{key} // q{} ) ne $self->_cache_key() || ref $cache->{tests} ne 'HASH';
-    return $cache->{tests};
+    my $usable = ref $cache eq 'HASH' && ( $cache->{key} // q{} ) eq $self->_cache_key() && ref $cache->{tests} eq 'HASH' && ref $cache->{versions} eq 'HASH';
+    return $usable ? $cache : { tests => {}, versions => {} };
 }
 
-# Replaces the file whole, so a reader never sees half of it.
+# Replaces the file whole, so a reader never sees half of it.  Keeps only the
+# versions that some record names.
 sub _write_cache {
-    my ( $self, $records ) = @_;
+    my ( $self, $records, $versions ) = @_;
 
-    my $path = $self->_cache_path() or return;
-    my $json = Cpanel::JSON::XS->new->canonical->encode( { key => $self->_cache_key(), root => $self->{root}, tests => $records } );
+    my $path  = $self->_cache_path() or return;
+    my %named = map { $_ => $versions->{$_} } grep { $versions->{$_} } map { values %{ $_->{loaded} } } values %$records;
+    my $json  = Cpanel::JSON::XS->new->canonical->encode( { key => $self->_cache_key(), root => $self->{root}, tests => $records, versions => \%named } );
 
     # The root goes in the gzip header too, so that _prune_cache can read it
     # without decompressing the file.
