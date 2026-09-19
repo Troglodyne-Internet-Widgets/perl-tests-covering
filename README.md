@@ -4,7 +4,7 @@ Perl::Tests::Covering - Which tests run the file you just changed, from coverage
 
 # VERSION
 
-version 0.001
+version 0.002
 
 # SYNOPSIS
 
@@ -116,6 +116,76 @@ Choosing by line trusts that each changed file still compiles.  A syntax error
 in a sub that no test runs chooses no tests, and still breaks every test that
 loads the file.  [tests-covering](https://metacpan.org/pod/tests-covering) says how to have the hook check that too.
 
+## THE MAP
+
+Some files reach a test without the test loading them.  A template that a
+test renders is one: the test reads it, and Perl does not record a read.
+Watching which files a test opens does not help either, as a template engine
+with a cache of compiled templates can read only its cache.  A script that a
+test runs under another perl is a second kind, since that perl cannot load
+[Perl::Tests::Covering::Recorder](https://metacpan.org/pod/Perl%3A%3ATests%3A%3ACovering%3A%3ARecorder).  Only the distribution knows which tests
+reach such files, and the map is how it says so.
+
+The map is a code reference.  It is called once for each path in the question
+that is not a test and that no record names as loaded:
+
+```perl
+sub {
+    my ( $path, $change ) = @_;
+    return 't/templates.t' if $path =~ m{\Atemplates/};
+    return;
+}
+```
+
+`$path` is relative to the root.  `$change` is the change to it from a diff,
+as below, or undef when the question is ["tests\_covering"](#tests_covering).  The map runs with
+the root as the working directory, and with the library directories at the
+front of `@INC`, so it can ask the distribution's own modules.  When it dies,
+the question dies.
+
+It returns paths relative to the root:
+
+- a test, which is chosen;
+- any other file, which stands in for `$path`: each test that loaded that file
+is chosen, whatever lines the change touched;
+- nothing, which leaves `$path` unexplained.
+
+To say that a path reaches no test, return the path itself, which no test
+loads.  A path that is neither a test nor a file under the root is dropped
+with a warning, so a mistake in the map leaves the path unexplained, and does
+not explain it away.
+
+A path that the map leaves unexplained chooses no test, unless the
+`unexplained` option is `all`, which chooses every test.  In a diff, a Perl
+file that the diff adds is not unexplained: the files that use it are in the
+diff too.
+
+The map answers when the question is asked, so it adds nothing to the cache,
+and a change to it makes no record stale.
+
+The change is a hash:
+
+- `old`, `new`
+
+    The path before and after, relative to the root.  Undef for a file the diff
+    adds or deletes, and for a path outside the root.
+
+- `old_blob`, `new_blob`
+
+    The git blob ids from the `index` line, which may be abbreviated, or undef.
+
+- `hunks`
+
+    How many hunks the diff has for the file.
+
+- `blocks`
+
+    Each run of removed and added lines, as a hash: `at`, the old line the run
+    starts at, or that the added lines go in before when nothing is removed;
+    `deleted`, the old line numbers removed, and `deleted_text`, their text;
+    `added`, the new line numbers added, and `added_text`, their text.  The text
+    has no line end.
+
 ## THE CACHE ON DISK
 
 The records of a distribution are one file of gzipped JSON, in
@@ -175,7 +245,7 @@ subs`.  And it reads a `cover_db` from any run of the suite, such as one in CI,
 and editors reach it through [Devel::PerlySense](https://metacpan.org/pod/Devel::PerlySense) and vim-covered.  This
 module runs the tests itself.
 
-This module does more in four ways.
+This module does more in five ways.
 
 - It keeps its answers current.  Devel::CoverX::Covered has no idea of a stale
 record.  After a test changes, it gives the old answer until the whole suite
@@ -192,6 +262,10 @@ loads and never calls, for a module that is all code at the top of the file,
 for a script without subs, or for the test itself.
 - It chooses by the lines of a diff.  Devel::CoverX::Covered chooses by file or
 by sub, and lists choosing by line as not done.
+- It can be told about files that no test loads, such as templates, through
+["THE MAP"](#the-map), and it can run every test for a change that nothing explains.
+Devel::CoverX::Covered knows only the files Devel::Cover measured, and chooses
+no test for any other.
 
 Both answer the question turned around, which files a test covers, and both
 choose by sub.  Devel::CoverX::Covered needs `Moose`, `DBD::SQLite`,
@@ -231,6 +305,20 @@ Every option is optional.
 
     Where the cache is kept.  The default is described in ["THE CACHE ON DISK"](#the-cache-on-disk).
 
+- `map`
+
+    What says which tests reach a file that no test loads: a code reference, or
+    the name of a Perl file that returns one.  ["THE MAP"](#the-map) says what it is called
+    with and what it returns.  The default is `.tests-covering-map.pl` in the
+    root, when there is one.  Pass `undef` for no map.  It dies when the file
+    does not compile or does not return a code reference.
+
+- `unexplained`
+
+    What to do about a file in the question that neither a record nor the map
+    explains: `none`, the default, chooses no test for it, and `all` chooses
+    every test.
+
 # METHODS
 
 ## root
@@ -261,7 +349,8 @@ my @tests = $covering->tests_covering(@files);
 
 The tests that cover any of `@files`, relative to the root, sorted.  A file
 that is relative is relative to the current directory, as it is on a command
-line.  A file outside the root, or covered by no test, adds nothing.
+line.  A file outside the root adds nothing.  A file that no test loads adds
+what the map and `unexplained` say, as ["THE MAP"](#the-map) describes.
 
 It calls ["refresh"](#refresh) first, so it can take as long as the stale tests take to
 run.  A test is reported when its record from before the refresh, or its record

@@ -323,7 +323,11 @@ DIFF
     is( [ @{$change}{qw{old new old_blob new_blob hunks}} ], [qw{lib/Foo.pm lib/Foo.pm 1234567 89abcde 3}], 'Paths without a/ and b/, the blobs, and the hunks' );
     is(
         $change->{blocks},
-        [ { at => 4, deleted => [4], added => [ 4, 5 ] }, { at => 11, deleted => [], added => [12] }, { at => 20, deleted => [20], added => [] } ],
+        [
+            { at => 4,  deleted => [4],  added => [ 4, 5 ], deleted_text => ['old four'],                                    added_text => [ 'new four', 'new five' ] },
+            { at => 11, deleted => [],   added => [12],     deleted_text => [],                                              added_text => ['added before old eleven'] },
+            { at => 20, deleted => [20], added => [],       deleted_text => ['-- a line that looks like a header, removed'], added_text => [] },
+        ],
         'A block replaced after context, code added where nothing was taken out, and a line taken out that reads like a header'
     );
 
@@ -508,6 +512,147 @@ subtest files_covered_by => sub {
     is( [ foo_records( sub { covering($root)->files_covered_by("$root/t/a.t") } ) ],  [qw{lib/Foo.pm t/a.t}], 'The files a test loaded, itself too' );
     is( [ foo_records( sub { covering($root)->files_covered_by('/bogus/t/a.t') } ) ], [],                     'A test outside the root loaded nothing' );
     like( dies { covering($root)->files_covered_by() }, qr/needs a test/, 'No test is an error' );
+};
+
+subtest 'new, with a map' => sub {
+    my $root = foo_dist();
+    my $code = sub { return };
+
+    is( covering( $root, map => $code )->{map}, exact_ref($code), 'A code reference is the map' );
+    is( covering($root)->{map},                 undef,            'With no map named and none at the root, there is none' );
+
+    write_file( $root, '.tests-covering-map.pl', "use Foo; sub { \$Foo::LOADED_BY_MAP = 1; return 't/a.t' };\n" );
+    write_file( $root, 'lib/Foo.pm',             "package Foo; our \$LOADED_BY_MAP; 1;\n" );
+    my $found = covering($root)->{map};
+    is( ref $found,                             'CODE', 'A map at the root is found without being named, and can load the modules of the distribution' );
+    is( covering( $root, map => undef )->{map}, undef,  'map => undef means none, even when there is one at the root' );
+
+    write_file( $root, 'maps/other.pl', "sub { return 't/b.t' };\n" );
+    is( [ covering( $root, map => "$root/maps/other.pl" )->{map}->() ], ['t/b.t'], 'A map named by its file is loaded from it' );
+
+    write_file( $root, 'maps/broken.pl', "sub {\n" );
+    write_file( $root, 'maps/nocode.pl', "42;\n" );
+    like( dies { covering( $root, map => "$root/maps/broken.pl" ) },            qr/Cannot compile the map/,            'A map that does not compile is an error' );
+    like( dies { covering( $root, map => "$root/maps/nocode.pl" ) },            qr/returns something, not a code ref/, 'and so is one that returns no code reference' );
+    like( dies { covering( $root, map => "$root/maps/nonexistent-bogus.pl" ) }, qr/Cannot read the map/,               'and so is one that is not there' );
+    like( dies { covering( $root, map => [] ) },                                qr/map must be a code reference or/,   'and so is a map that is neither code nor a file' );
+
+    like( dies { covering( $root, unexplained => 'some' ) }, qr/unexplained must be none or all, not 'some'/, 'unexplained is none or all' );
+    ok( lives { covering( $root, unexplained => $_ ) }, "unexplained => '$_' is accepted" ) for qw{none all};
+};
+
+subtest 'tests_covering, with a map' => sub {
+    my @asked;
+    my $template = sub {
+        my ( $root, %opts ) = @_;
+        write_file( $root, 'templates/page.tt', "[% page %]\n" );
+        return foo_records( sub { [ covering( $root, %opts )->tests_covering("$root/templates/page.tt") ] } );
+    };
+    my $map_saying = sub {
+        my @answer = @_;
+        return sub { push @asked, [@_]; return @answer };
+    };
+
+    is( $template->( foo_dist(), map => $map_saying->('t/d.t') ), ['t/d.t'],                          'A file no test loads is covered by the tests the map names' );
+    is( \@asked,                                                  [ [ 'templates/page.tt', undef ] ], 'The map is asked about it once, relative to the root, with no change' );
+
+    @asked = ();
+    my $twice = foo_dist();
+    write_file( $twice, 'templates/page.tt', "[% page %]\n" );
+    foo_records( sub { covering( $twice, map => $map_saying->() )->tests_covering( ("$twice/templates/page.tt") x 2 ) } );
+    is( scalar @asked, 1, 'even when it is named twice' );
+
+    is( $template->( foo_dist(), map => $map_saying->('lib/Foo.pm') ),                              [qw{t/a.t t/b.t t/c.t}],       'A file the map names stands in for it: its loaders cover it' );
+    is( $template->( foo_dist(), map => $map_saying->( 't/d.t', 'lib/Foo.pm' ) ),                   [qw{t/a.t t/b.t t/c.t t/d.t}], 'Tests and files together' );
+    is( $template->( foo_dist(), map => $map_saying->() ),                                          [],                            'A map with nothing to say, and unexplained none, chooses nothing' );
+    is( $template->( foo_dist(), map => $map_saying->(), unexplained => 'all' ),                    [qw{t/a.t t/b.t t/c.t t/d.t}], 'but with unexplained all, every test' );
+    is( $template->( foo_dist(), map => undef, unexplained => 'all' ),                              [qw{t/a.t t/b.t t/c.t t/d.t}], 'and so with no map at all' );
+    is( $template->( foo_dist(), map => $map_saying->('templates/page.tt'), unexplained => 'all' ), [],                            'A map says a file reaches no test by naming the file itself' );
+
+    my ( $got, $warned );
+    $warned = warnings { $got = $template->( foo_dist(), map => $map_saying->( 't/nonexistent-bogus.t', '/bogus/abs' ), unexplained => 'all' ) };
+    like( $warned, [ qr/the map said 't\/nonexistent-bogus.t' for templates\/page.tt, which is neither a test nor a file/, qr/'\/bogus\/abs'/ ], 'A path that is neither a test nor a file is dropped with a warning' );
+    is( $got, [qw{t/a.t t/b.t t/c.t t/d.t}], 'and leaves the file unexplained, not explained away' );
+
+    @asked = ();
+    my $root = foo_dist();
+    foo_records( sub { covering( $root, map => $map_saying->('t/d.t') )->tests_covering( "$root/lib/Foo.pm", "$root/t/d.t" ) } );
+    is( \@asked, [], 'The map is not asked about a file a record names, nor about a test' );
+
+    my $cwd = Cwd::getcwd();
+    like(
+        dies {
+            $template->( foo_dist(), map => sub { die "no idea\n" } )
+        },
+        qr/no idea/,
+        'A map that dies makes the question die'
+    );
+    is( Cwd::getcwd(), $cwd, 'with the working directory put back' );
+
+    my $where;
+    my $in = foo_dist();
+    $template->( $in, map => sub { $where = Cwd::getcwd(); return } );
+    is( $where, $in, 'The map runs in the root' );
+};
+
+subtest 'tests_covering_diff, with a map' => sub {
+    my $root = foo_dist();
+    write_file( $root, 'templates/page.tt', "[% page %]\n[%# a comment %]\n" );
+    foo_records( sub { covering($root)->refresh() } );
+
+    my @asked;
+    my $map = sub { my ( $path, $change ) = @_; push @asked, [ $path, $change ]; return 't/d.t' };
+
+    my $diff = change_lines( $root, 'templates/page.tt', 2, 1, '[%# a better comment %]' );
+    is(
+        [
+            in_dir(
+                $root,
+                sub {
+                    foo_records( sub { covering( $root, map => $map )->tests_covering_diff($diff) } );
+                }
+            )
+        ],
+        ['t/d.t'],
+        'A file in a diff that no test loads is covered by what the map says'
+    );
+    is( scalar @asked,                         1,                           'The map is asked once' );
+    is( $asked[0][0],                          'templates/page.tt',         'about the path relative to the root' );
+    is( $asked[0][1]{blocks}[0]{deleted_text}, ['[%# a comment %]'],        'with the change, whose blocks have the removed text' );
+    is( $asked[0][1]{blocks}[0]{added_text},   ['[%# a better comment %]'], 'and the added text' );
+
+    $root = foo_dist();
+    foo_records( sub { covering($root)->refresh() } );
+    write_file( $root, 'templates/new.tt', "new\n" );
+    write_file( $root, 'lib/New.pm',       "package New; 1;\n" );
+    write_file( $root, 'bin/new',          "#!/usr/bin/perl\n1;\n" );
+    $diff = join q{}, map { "diff --git a/$_ b/$_\nnew file mode 100644\nindex 0000000..1234567\n--- /dev/null\n+++ b/$_\n\@\@ -0,0 +1 \@\@\n+x\n" } qw{lib/New.pm bin/new};
+    is(
+        [
+            in_dir(
+                $root,
+                sub {
+                    foo_records( sub { covering( $root, unexplained => 'all' )->tests_covering_diff($diff) } );
+                }
+            )
+        ],
+        [],
+        'A Perl file new in the diff is not unexplained, by its name or its #! line'
+    );
+
+    $diff = "diff --git a/templates/new.tt b/templates/new.tt\nnew file mode 100644\nindex 0000000..1234567\n--- /dev/null\n+++ b/templates/new.tt\n\@\@ -0,0 +1 \@\@\n+new\n";
+    is(
+        [
+            in_dir(
+                $root,
+                sub {
+                    foo_records( sub { covering( $root, unexplained => 'all' )->tests_covering_diff($diff) } );
+                }
+            )
+        ],
+        [qw{t/a.t t/b.t t/c.t t/d.t}],
+        'but any other new file is'
+    );
 };
 
 subtest _prune_cache => sub {

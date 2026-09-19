@@ -41,6 +41,9 @@ use Perl::Tests::Covering ();
       --lib DIR        a directory for PERL5LIB, relative to the root; repeatable; default: lib
       --jobs N         how many coverage runs at once; default: 1
       --cache-dir DIR  where the coverage records are kept
+      --map FILE       a Perl file that returns the map; default: .tests-covering-map.pl in the root
+      --no-map         use no map, even when the root has one
+      --unexplained W  none or all: the tests a file nothing explains chooses; default: none
       --help           this text
 
 =head1 DESCRIPTION
@@ -58,6 +61,11 @@ With C<--diff>, it reads a unified diff from git on standard input and prints
 the tests whose runs reached the lines the diff changes.  It runs nothing
 first.  L<Perl::Tests::Covering/CHOOSING TESTS FOR A CHANGE> says how it
 decides, and when it falls back to every test that loads a file.
+
+A file that no test loads, such as a template that a test reads, chooses the
+tests that the map names.  L<Perl::Tests::Covering/THE MAP> says how to write
+one.  A file that neither a record nor the map explains chooses no test, or
+with C<--unexplained all>, every test.
 
 With C<--sub>, it prints the tests that ran a statement of one sub.  With
 C<--by>, it prints the files each test you name loaded, which is the question
@@ -109,6 +117,11 @@ Without it, a test whose records are older than the last commit is run
 whenever it loaded a file that changed since, and the choice gets coarser with
 each commit.  Run C<tests-covering --refresh> by hand to catch up.
 
+A pre-commit hook for a distribution whose tests read templates, or run
+scripts under another perl, wants a map in F<.tests-covering-map.pl> at the
+root, and C<--unexplained all>.  Then a change that the records and the map
+cannot follow runs every test, and the hook needs no list of its own.
+
 Choosing by hunk trusts that each changed file still compiles.  A syntax error
 in a sub that no test runs chooses no tests, and still breaks every test that
 loads the file.  Put C<perl -c> over the changed files in the pre-commit hook
@@ -132,22 +145,26 @@ sub main {
     my (@argv) = @_;
 
     my %opts = ( 'test-dir' => [], lib => [] );
-    Getopt::Long::GetOptionsFromArray( \@argv, \%opts, qw{root=s test-dir=s@ lib=s@ jobs=i cache-dir=s diff sub=s by refresh help} )
+    Getopt::Long::GetOptionsFromArray( \@argv, \%opts, qw{root=s test-dir=s@ lib=s@ jobs=i cache-dir=s map=s no-map unexplained=s diff sub=s by refresh help} )
       or return synopsis(2);
     return synopsis(0) if $opts{help};
 
     my @modes = grep { defined $opts{$_} } qw{diff sub by refresh};
     return usage_error('Give one of --diff, --sub, --by and --refresh, not several') if @modes > 1;
     my $mode = $modes[0] // 'files';
-    return usage_error("--$mode takes no files")       if @argv          && grep { $mode eq $_ } qw{diff refresh};
-    return usage_error('--sub takes exactly one file') if $mode eq 'sub' && @argv != 1;
+    return usage_error("--$mode takes no files")           if @argv              && grep { $mode eq $_ } qw{diff refresh};
+    return usage_error('--sub takes exactly one file')     if $mode eq 'sub'     && @argv != 1;
+    return usage_error('Give --map or --no-map, not both') if defined $opts{map} && $opts{'no-map'};
 
     my $covering = Perl::Tests::Covering->new(
-        ( defined $opts{root}        ? ( root      => $opts{root} )        : () ),
-        ( @{ $opts{'test-dir'} }     ? ( tests     => $opts{'test-dir'} )  : () ),
-        ( @{ $opts{lib} }            ? ( lib       => $opts{lib} )         : () ),
-        ( defined $opts{jobs}        ? ( jobs      => $opts{jobs} )        : () ),
-        ( defined $opts{'cache-dir'} ? ( cache_dir => $opts{'cache-dir'} ) : () ),
+        ( defined $opts{root}        ? ( root        => $opts{root} )        : () ),
+        ( @{ $opts{'test-dir'} }     ? ( tests       => $opts{'test-dir'} )  : () ),
+        ( @{ $opts{lib} }            ? ( lib         => $opts{lib} )         : () ),
+        ( defined $opts{jobs}        ? ( jobs        => $opts{jobs} )        : () ),
+        ( defined $opts{'cache-dir'} ? ( cache_dir   => $opts{'cache-dir'} ) : () ),
+        ( defined $opts{map}         ? ( map         => $opts{map} )         : () ),
+        ( $opts{'no-map'}            ? ( map         => undef )              : () ),
+        ( defined $opts{unexplained} ? ( unexplained => $opts{unexplained} ) : () ),
     );
 
     my @names     = @argv || $mode eq 'refresh' || $mode eq 'diff' ? @argv : read_names( \*STDIN );

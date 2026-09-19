@@ -93,6 +93,12 @@ write_file( $hunks, 't/top.t',      "use Test::More;\nuse Steps;\nis( Steps::up(
 write_file( $hunks, 't/down.t',     "#!perl -T\nuse Test::More;\nuse Steps;\nis( Steps::down(1), 0 );\ndone_testing;\n" );
 write_file( $hunks, 't/none.t',     "use Test::More;\nok(1);\ndone_testing;\n" );
 
+# A test that reads a template and loads no module for it, and the map that
+# says so, where the module finds it without being told.
+write_file( $hunks, 'templates/greeting.tt',  "Hello [% name %]\n" );
+write_file( $hunks, 't/greet.t',              q{use Test::More; open my $fh, '<', 'templates/greeting.tt' or die; like( scalar <$fh>, qr/Hello/ ); done_testing;} . "\n" );
+write_file( $hunks, '.tests-covering-map.pl', q{sub { my ($path) = @_; return $path =~ m{\Atemplates/} ? 't/greet.t' : () };} . "\n" );
+
 my %hunk_cover = ( root => $hunks, cache_dir => File::Spec->catdir( $hunks, '.cache-bogus' ) );
 my $steps      = File::Slurper::read_binary("$hunks/lib/Steps.pm");
 
@@ -124,6 +130,19 @@ subtest 'tests_covering_sub and files_covered_by, from real coverage runs' => su
     is( [ $covering->tests_covering_sub( "$hunks/lib/Steps.pm", 'down' ) ], ['t/down.t'],              'The test that ran sub down' );
     is( [ $covering->files_covered_by("$hunks/t/up.t") ],                   [qw{lib/Steps.pm t/up.t}], 'The files a test loaded' );
     is( [ $covering->files_covered_by("$hunks/t/none.t") ],                 ['t/none.t'],              'A test that loads nothing of the distribution loaded itself' );
+};
+
+subtest 'the map, from real coverage runs' => sub {
+    my $covering = Perl::Tests::Covering->new(%hunk_cover);
+    is( [ $covering->files_covered_by("$hunks/t/greet.t") ],           ['t/greet.t'], 'A test that reads a template does not load it' );
+    is( [ $covering->tests_covering("$hunks/templates/greeting.tt") ], ['t/greet.t'], 'so the map at the root says which test it reaches' );
+
+    my $diff = change_lines( $hunks, 'templates/greeting.tt', 1, 1, 'Hi [% name %]' );
+    my $was  = Cwd::getcwd();
+    chdir $hunks or die $!;
+    my @tests = Perl::Tests::Covering->new(%hunk_cover)->tests_covering_diff($diff);
+    chdir $was or die $!;
+    is( \@tests, ['t/greet.t'], 'and the same in a diff' );
 };
 
 done_testing();

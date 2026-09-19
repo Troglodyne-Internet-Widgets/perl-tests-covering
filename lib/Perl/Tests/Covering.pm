@@ -157,6 +157,90 @@ Choosing by line trusts that each changed file still compiles.  A syntax error
 in a sub that no test runs chooses no tests, and still breaks every test that
 loads the file.  L<tests-covering> says how to have the hook check that too.
 
+=head2 THE MAP
+
+Some files reach a test without the test loading them.  A template that a
+test renders is one: the test reads it, and Perl does not record a read.
+Watching which files a test opens does not help either, as a template engine
+with a cache of compiled templates can read only its cache.  A script that a
+test runs under another perl is a second kind, since that perl cannot load
+L<Perl::Tests::Covering::Recorder>.  Only the distribution knows which tests
+reach such files, and the map is how it says so.
+
+The map is a code reference.  It is called once for each path in the question
+that is not a test and that no record names as loaded:
+
+    sub {
+        my ( $path, $change ) = @_;
+        return 't/templates.t' if $path =~ m{\Atemplates/};
+        return;
+    }
+
+C<$path> is relative to the root.  C<$change> is the change to it from a diff,
+as below, or undef when the question is L</tests_covering>.  The map runs with
+the root as the working directory, and with the library directories at the
+front of C<@INC>, so it can ask the distribution's own modules.  When it dies,
+the question dies.
+
+It returns paths relative to the root:
+
+=over 4
+
+=item *
+
+a test, which is chosen;
+
+=item *
+
+any other file, which stands in for C<$path>: each test that loaded that file
+is chosen, whatever lines the change touched;
+
+=item *
+
+nothing, which leaves C<$path> unexplained.
+
+=back
+
+To say that a path reaches no test, return the path itself, which no test
+loads.  A path that is neither a test nor a file under the root is dropped
+with a warning, so a mistake in the map leaves the path unexplained, and does
+not explain it away.
+
+A path that the map leaves unexplained chooses no test, unless the
+C<unexplained> option is C<all>, which chooses every test.  In a diff, a Perl
+file that the diff adds is not unexplained: the files that use it are in the
+diff too.
+
+The map answers when the question is asked, so it adds nothing to the cache,
+and a change to it makes no record stale.
+
+The change is a hash:
+
+=over 4
+
+=item C<old>, C<new>
+
+The path before and after, relative to the root.  Undef for a file the diff
+adds or deletes, and for a path outside the root.
+
+=item C<old_blob>, C<new_blob>
+
+The git blob ids from the C<index> line, which may be abbreviated, or undef.
+
+=item C<hunks>
+
+How many hunks the diff has for the file.
+
+=item C<blocks>
+
+Each run of removed and added lines, as a hash: C<at>, the old line the run
+starts at, or that the added lines go in before when nothing is removed;
+C<deleted>, the old line numbers removed, and C<deleted_text>, their text;
+C<added>, the new line numbers added, and C<added_text>, their text.  The text
+has no line end.
+
+=back
+
 =head2 THE CACHE ON DISK
 
 The records of a distribution are one file of gzipped JSON, in
@@ -216,7 +300,7 @@ subs>.  And it reads a F<cover_db> from any run of the suite, such as one in CI,
 and editors reach it through L<Devel::PerlySense|https://metacpan.org/pod/Devel::PerlySense> and vim-covered.  This
 module runs the tests itself.
 
-This module does more in four ways.
+This module does more in five ways.
 
 =over 4
 
@@ -247,6 +331,13 @@ for a script without subs, or for the test itself.
 It chooses by the lines of a diff.  Devel::CoverX::Covered chooses by file or
 by sub, and lists choosing by line as not done.
 
+=item *
+
+It can be told about files that no test loads, such as templates, through
+L</THE MAP>, and it can run every test for a change that nothing explains.
+Devel::CoverX::Covered knows only the files Devel::Cover measured, and chooses
+no test for any other.
+
 =back
 
 Both answer the question turned around, which files a test covers, and both
@@ -265,6 +356,9 @@ Readonly::Scalar my $CACHE_FILE_RX => qr/\A[0-9a-f]{40}[.]json[.]gz\z/;
 
 # The files that say a directory is the root of a distribution.
 Readonly::Array my @DIST_MARKERS => qw{dist.ini Makefile.PL Build.PL cpanfile META.json .git};
+
+# The map a distribution has when it names none.
+Readonly::Scalar my $DEFAULT_MAP => '.tests-covering-map.pl';
 
 # What exec returns with in a child that could not become the test.
 Readonly::Scalar my $EXEC_FAILED => 127;
@@ -308,6 +402,20 @@ How many tests run at once.  The default is 1.
 
 Where the cache is kept.  The default is described in L</THE CACHE ON DISK>.
 
+=item C<map>
+
+What says which tests reach a file that no test loads: a code reference, or
+the name of a Perl file that returns one.  L</THE MAP> says what it is called
+with and what it returns.  The default is F<.tests-covering-map.pl> in the
+root, when there is one.  Pass C<undef> for no map.  It dies when the file
+does not compile or does not return a code reference.
+
+=item C<unexplained>
+
+What to do about a file in the question that neither a record nor the map
+explains: C<none>, the default, chooses no test for it, and C<all> chooses
+every test.
+
 =back
 
 =cut
@@ -315,7 +423,7 @@ Where the cache is kept.  The default is described in L</THE CACHE ON DISK>.
 sub new {
     my ( $class, %opts ) = @_;
 
-    my %known   = map  { $_ => 1 } qw{root tests lib jobs cache_dir};
+    my %known   = map  { $_ => 1 } qw{root tests lib jobs cache_dir map unexplained};
     my @unknown = grep { !$known{$_} } sort keys %opts;
     Carp::croak("Unknown option(s) to $class->new: @unknown") if @unknown;
 
@@ -329,14 +437,22 @@ sub new {
     my $jobs = $opts{jobs} // 1;
     Carp::croak("jobs must be a whole number of 1 or more, not '$jobs'") if $jobs !~ m/\A[1-9][0-9]*\z/;
 
-    return bless {
-        root      => $root,
-        tests     => [ @{ $opts{tests} // ['t'] } ],
-        lib       => [ @{ $opts{lib}   // ['lib'] } ],
-        jobs      => $jobs,
-        cache_dir => $opts{cache_dir} // _default_cache_dir(),
-        blob      => {},
+    my $unexplained = $opts{unexplained} // 'none';
+    Carp::croak("unexplained must be none or all, not '$unexplained'") if $unexplained !~ m/\A(?:none|all)\z/;
+
+    my $self = bless {
+        root        => $root,
+        tests       => [ @{ $opts{tests} // ['t'] } ],
+        lib         => [ @{ $opts{lib}   // ['lib'] } ],
+        jobs        => $jobs,
+        cache_dir   => $opts{cache_dir} // _default_cache_dir(),
+        unexplained => $unexplained,
+        blob        => {},
     }, $class;
+
+    my $default_map = File::Spec->catfile( $root, $DEFAULT_MAP );
+    $self->{map} = $self->_load_map( exists $opts{map} ? $opts{map} : -e $default_map ? $default_map : undef );
+    return $self;
 }
 
 =head1 METHODS
@@ -417,7 +533,8 @@ sub refresh {
 
 The tests that cover any of C<@files>, relative to the root, sorted.  A file
 that is relative is relative to the current directory, as it is on a command
-line.  A file outside the root, or covered by no test, adds nothing.
+line.  A file outside the root adds nothing.  A file that no test loads adds
+what the map and C<unexplained> say, as L</THE MAP> describes.
 
 It calls L</refresh> first, so it can take as long as the stale tests take to
 run.  A test is reported when its record from before the refresh, or its record
@@ -432,12 +549,9 @@ sub tests_covering {
     my @wanted = grep { defined } map { $self->_relative( $_, Cwd::getcwd() ) } @files;
     $self->refresh();
 
-    my %covering;
-    foreach my $records ( $self->{before}, $self->{after} ) {
-        foreach my $test ( keys %$records ) {
-            $covering{$test} = 1 if grep { exists $records->{$test}{loaded}{$_} } @wanted;
-        }
-    }
+    my @records  = ( $self->{before}, $self->{after} );
+    my %covering = map { $_ => 1 } map { _loaders( $_, @records ) } @wanted;
+    $covering{$_} = 1 for $self->_unexplained_tests( \@wanted, \@records, {} );
 
     # A test that is gone covers nothing it could be run for.
     return sort grep { $self->{after}{$_} } keys %covering;
@@ -468,12 +582,21 @@ sub tests_covering_diff {
     my @changes = map { $self->_resolve_change( $_, $cwd ) } _parse_diff($diff);
     my %in_diff = map { $_ => 1 } grep { defined } map { @{$_}{qw{old new}} } @changes;
 
-    my @tests;
+    my %chosen;
     foreach my $test ( $self->tests() ) {
         my $record = $cache->{tests}{$test};
-        push @tests, $test if $in_diff{$test} || !$self->_record_holds( $record, \%in_diff ) || grep { $self->_change_reaches( $_, $record, $cache->{versions} ) } @changes;
+        $chosen{$test} = 1 if $in_diff{$test} || !$self->_record_holds( $record, \%in_diff ) || grep { $self->_change_reaches( $_, $record, $cache->{versions} ) } @changes;
     }
-    return @tests;
+
+    # A Perl file that is new in the diff is reached through the files that
+    # use it, which are in the diff too.
+    my %change_of;
+    foreach my $change (@changes) {
+        next if !defined $change->{old} && defined $change->{new} && $self->_is_perl( $change->{new} );
+        $change_of{$_} //= $change for grep { defined } @{$change}{qw{old new}};
+    }
+    $chosen{$_} = 1 for $self->_unexplained_tests( [ sort keys %change_of ], [ $cache->{tests} ], \%change_of );
+    return sort keys %chosen;
 }
 
 =head2 tests_covering_sub
@@ -524,6 +647,102 @@ sub files_covered_by {
     my $rel = $self->_relative( $test, Cwd::getcwd() ) // return;
     $self->refresh();
     return sort keys %{ $self->{after}{$rel}{loaded} // {} };
+}
+
+# The tests whose record, in any of @records, names $file as loaded.
+sub _loaders {
+    my ( $file, @records ) = @_;
+    return map {
+        my $records = $_;
+        grep { exists $records->{$_}{loaded}{$file} } keys %$records
+    } @records;
+}
+
+# The tests that the map, and then the unexplained option, choose for the
+# paths in @$paths that no test is and no record in @$records names.
+# $change_of holds the change from a diff for each path that has one.
+sub _unexplained_tests {
+    my ( $self, $paths, $records, $change_of ) = @_;
+
+    my %tests = map { $_ => 1 } $self->tests();
+    my ( %chosen, $unexplained );
+    foreach my $path ( grep { !$tests{$_} && !_loaders( $_, @$records ) } List::Util::uniq(@$paths) ) {
+        my @said = $self->_ask_map( $path, $change_of->{$path}, \%tests );
+        $unexplained ||= !@said;
+        $chosen{$_} = 1 for grep { $tests{$_} } @said;
+        $chosen{$_} = 1 for map  { _loaders( $_, @$records ) } grep { !$tests{$_} } @said;
+    }
+    return sort keys %tests if $unexplained && $self->{unexplained} eq 'all';
+    return grep { $tests{$_} } sort keys %chosen;
+}
+
+# What the map says about one path: tests, and files that stand in for it,
+# relative to the root.  A path that is neither a test nor a file under the
+# root is dropped with a warning, so a mistake in the map leaves the path
+# unexplained rather than explained by nothing.
+sub _ask_map {
+    my ( $self, $path, $change, $tests ) = @_;
+
+    my $map  = $self->{map} or return;
+    my @said = $self->_in_root( sub { $map->( $path, $change ) } );
+
+    my @kept;
+    foreach my $said (@said) {
+        my $rel = defined $said ? $self->_relative( $said, $self->{root} ) : undef;
+        if ( defined $rel && ( $tests->{$rel} || ( -e File::Spec->catfile( $self->{root}, $rel ) && !-d _ ) ) ) {
+            push @kept, $rel;
+            next;
+        }
+        warn "tests-covering: the map said '${\( $said // 'undef' )}' for $path, which is neither a test nor a file under the root\n";
+    }
+    return @kept;
+}
+
+# The code reference a map option names, or undef for none.  A file is run
+# as _in_root runs the map, so it can load the distribution's own modules.
+sub _load_map {
+    my ( $self, $map ) = @_;
+
+    return                                                                                 if !defined $map;
+    return $map                                                                            if ref $map eq 'CODE';
+    Carp::croak( 'map must be a code reference or the name of a file, not a ' . ref $map ) if ref $map;
+
+    my $path = File::Spec->rel2abs($map);
+    my ($code) = $self->_in_root(
+        sub {
+            local ( $@, $! );
+            my $got = do $path;
+            Carp::croak("Cannot compile the map $map: $@")                        if $@;
+            Carp::croak("Cannot read the map $map: ${\( $! || 'no such file' )}") if !defined $got && ( $! || !-e $path );
+            return $got;
+        }
+    );
+    Carp::croak("The map $map returns ${\( ref $code || 'something' )}, not a code reference") if ref $code ne 'CODE';
+    return $code;
+}
+
+# Runs $code with the root as the working directory and the library
+# directories at the front of @INC, and returns what it returns in list
+# context.  A die in $code dies here, after the working directory is back.
+sub _in_root {
+    my ( $self, $code ) = @_;
+
+    my $was = Cwd::getcwd();
+    chdir $self->{root} or Carp::croak("Cannot chdir to $self->{root}: $!");
+    local @INC = ( ( map { File::Spec->rel2abs( $_, $self->{root} ) } @{ $self->{lib} } ), @INC );
+    my @got = eval { $code->() };
+    my $err = $@;
+    chdir $was or Carp::croak("Cannot chdir back to $was: $!");
+    die $err if $err;
+    return @got;
+}
+
+# Whether a file relative to the root is Perl: by its name, or by a #! line
+# that names perl.
+sub _is_perl {
+    my ( $self, $rel ) = @_;
+    return 1 if $rel =~ m/[.](?:pm|pl|PL|t)\z/;
+    return ( _first_line( File::Spec->catfile( $self->{root}, $rel ) ) // q{} ) =~ m/\A#!.*\bperl/;
 }
 
 # The nearest directory, from $dir upwards, that holds a distribution.
@@ -796,9 +1015,7 @@ sub _distribution_file {
 
 # Each file a unified diff changes: its old and new paths as the diff names
 # them, or undef for /dev/null; the blob ids from its index line, which may be
-# abbreviated; and its blocks.  A block is a run of removed and added lines:
-# at is the old line it starts at, or that the added lines go in before when
-# nothing is removed; deleted holds old line numbers and added new ones.
+# abbreviated; and its blocks, which L</THE MAP> describes.
 sub _parse_diff {
     my ($diff) = @_;
 
@@ -822,8 +1039,10 @@ sub _hunk_line {
     my $mark = substr $line, 0, 1;
     if ( $mark eq q{-} || $mark eq q{+} ) {
         $at->{block} //= _new_block( $at->{changes}[-1], $at->{old} );
-        my $side = $mark eq q{-} ? 'old' : 'new';
-        push @{ $at->{block}{ $side eq 'old' ? 'deleted' : 'added' } }, $at->{$side}++;
+        my $side = $mark eq q{-}  ? 'old'     : 'new';
+        my $kind = $side eq 'old' ? 'deleted' : 'added';
+        push @{ $at->{block}{$kind} }, $at->{$side}++;
+        push @{ $at->{block}{"${kind}_text"} }, substr $line, 1;
         $at->{"${side}_left"}--;
         return;
     }
@@ -869,7 +1088,7 @@ sub _header_line {
 
 sub _new_block {
     my ( $change, $at ) = @_;
-    my $block = { at => $at, deleted => [], added => [] };
+    my $block = { at => $at, deleted => [], added => [], deleted_text => [], added_text => [] };
     push @{ $change->{blocks} }, $block;
     return $block;
 }

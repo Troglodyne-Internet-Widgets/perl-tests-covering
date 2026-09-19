@@ -96,6 +96,16 @@ subtest main => sub {
         'Each option reaches the module under its own name'
     );
 
+    @new_opts = ();
+    run_main( $root, q{}, qw{--map /bogus/map.pl --unexplained all x} );
+    run_main( $root, q{}, qw{--no-map x} );
+    is( \@new_opts, [ { map => '/bogus/map.pl', unexplained => 'all' }, { map => undef } ], '--map names the map, --no-map passes undef, and --unexplained passes through' );
+
+    my ( $both, $both_out );
+    my $warned = warnings { ( $both, $both_out ) = run_main( $root, q{}, qw{--map /bogus/map.pl --no-map x} ) };
+    like( $warned, [qr/Give --map or --no-map, not both/], '--map with --no-map is refused, and says why' );
+    is( [ $both, $both_out ], [ 2, q{} ], 'with exit 2' );
+
     my ( $bad, $bad_out, $bad_err );
     my $warnings = warnings { ( $bad, $bad_out, $bad_err ) = run_main( $root, q{}, qw{--bogus} ) };
     like( $warnings, [qr/Unknown option: bogus/], 'An option it does not know is named in a warning' );
