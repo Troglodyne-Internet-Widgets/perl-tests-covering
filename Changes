@@ -1,0 +1,7 @@
+Revision history for Perl-Tests-Covering
+
+0.001 2026-09-19 TEODESIAN
+    - Initial Release.  Perl::Tests::Covering says which tests of a
+      distribution load a given file, from records of Devel::Cover runs kept
+      in a cache, and runs again only the tests whose records are stale.
+      bin/tests-covering is the command line, meant for a pre-commit hook.

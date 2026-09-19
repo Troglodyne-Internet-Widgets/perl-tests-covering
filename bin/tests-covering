@@ -1,0 +1,133 @@
+#!/usr/bin/env perl
+
+package Perl::Tests::Covering::Script;
+
+# PODNAME: tests-covering
+# ABSTRACT: Print the tests that cover the files you name.
+
+use 5.014;
+
+use strict;
+use warnings FATAL => 'all';
+
+use re '/aa';
+
+use Cwd          ();
+use File::Spec   ();
+use Getopt::Long ();
+use Pod::Usage   ();
+
+use Perl::Tests::Covering ();
+
+=head1 SYNOPSIS
+
+    tests-covering [options] FILE...
+    git diff --cached --name-only --diff-filter=ACMRD | tests-covering
+
+    Options:
+      --root DIR       the distribution; default: found from the current directory
+      --test-dir DIR   a directory of tests, relative to the root; repeatable; default: t
+      --lib DIR        a directory for PERL5LIB, relative to the root; repeatable; default: lib
+      --jobs N         how many coverage runs at once; default: 1
+      --cache-dir DIR  where the coverage records are kept
+      --help           this text
+
+=head1 DESCRIPTION
+
+Prints the tests that cover any of the files you name, one per line, relative
+to the current directory.  With no files on the command line, it reads their
+names from standard input, one per line.  A file that is relative is relative to
+the current directory.
+
+Tests that are new, or that changed, or whose files changed, run first under
+L<Devel::Cover>, with their output discarded.  L<Perl::Tests::Covering> says
+what counts as covering and when a test runs again.
+
+It exits 0 when it printed an answer, which can be no tests at all, and 2 when
+the options are wrong.
+
+=head1 A PRE-COMMIT HOOK
+
+Put this in F<.git/hooks/pre-commit> and make it executable:
+
+    #!/bin/sh
+    tests=$(git diff --cached --name-only --diff-filter=ACMRD | tests-covering) || exit 1
+    [ -z "$tests" ] && exit 0
+    exec prove -l $tests
+
+C<D> is in the filter on purpose.  A deleted module is reported as covered by
+the tests that used it, and those are the tests the deletion breaks.
+
+The tests run against the working tree, not against what is staged.  If you
+stage part of a file, the tests see all of it.  Git starts the hook in the top
+directory of the work tree, so if the distribution is in a subdirectory, pass
+C<--root>.
+
+The first commit after the hook is installed runs every test under coverage,
+which is slow.  Run C<tests-covering> once by hand beforehand, with C<--jobs>,
+to have that done when it suits you.
+
+=cut
+
+exit main(@ARGV) if !caller;
+
+=head1 FUNCTIONS
+
+=head2 main
+
+    exit main(@ARGV);
+
+Everything the command does.  Returns the exit code.
+
+=cut
+
+sub main {
+    my (@argv) = @_;
+
+    my %opts = ( 'test-dir' => [], lib => [] );
+    Getopt::Long::GetOptionsFromArray( \@argv, \%opts, qw{root=s test-dir=s@ lib=s@ jobs=i cache-dir=s help} )
+      or return synopsis(2);
+    return synopsis(0) if $opts{help};
+
+    my @files = @argv ? @argv : read_names( \*STDIN );
+
+    my $covering = Perl::Tests::Covering->new(
+        ( defined $opts{root}        ? ( root      => $opts{root} )        : () ),
+        ( @{ $opts{'test-dir'} }     ? ( tests     => $opts{'test-dir'} )  : () ),
+        ( @{ $opts{lib} }            ? ( lib       => $opts{lib} )         : () ),
+        ( defined $opts{jobs}        ? ( jobs      => $opts{jobs} )        : () ),
+        ( defined $opts{'cache-dir'} ? ( cache_dir => $opts{'cache-dir'} ) : () ),
+    );
+
+    my $cwd = Cwd::getcwd();
+    foreach my $test ( $covering->tests_covering(@files) ) {
+        say File::Spec->abs2rel( File::Spec->catfile( $covering->root(), $test ), $cwd );
+    }
+    return 0;
+}
+
+=head2 read_names
+
+The file names in a handle, one per line, without blank lines.
+
+=cut
+
+sub read_names {
+    my ($fh) = @_;
+    return grep { length } map { s/\r?\n\z//r } <$fh>;
+}
+
+=head2 synopsis
+
+Prints the synopsis, to standard output when it was asked for and to standard
+error when the options were wrong, and returns the exit code.
+
+=cut
+
+sub synopsis {
+    my ($code) = @_;
+    Pod::Usage::pod2usage( -input => __FILE__, -exitval => 'NOEXIT', -verbose => 1, -output => $code ? \*STDERR : \*STDOUT );
+    return $code;
+}
+
+1;
