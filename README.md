@@ -4,7 +4,7 @@ Perl::Tests::Covering - Which tests run the file you just changed, from coverage
 
 # VERSION
 
-version 0.002
+version 0.003
 
 # SYNOPSIS
 
@@ -442,6 +442,10 @@ feature.
 Current Maintainers:
 
 - George S. Baugh <george@troglodyne.net>
+
+# CONTRIBUTOR
+
+troglodyne-robot <trogbot@troglodyne.net>
 
 # COPYRIGHT AND LICENSE
 
