@@ -219,6 +219,15 @@ The cache also records the stamp of this module's file, the version of perl,
 and the configured test and library directories.  If any of them changes, all
 of the records are stale.
 
+If a root has no usable cache of its own, it reads the cache of the same
+distribution in another checkout of its git repository.  It reads the main
+checkout first, and then each linked worktree that `.git/worktrees` lists.  So a
+new worktree starts from the records of the checkout that it came from, and
+does not run every test.  A record holds the blob ids of the files that its
+test loaded.  So a record from another checkout counts only where those files
+are the same.  The first refresh writes what it took to the cache file of the
+root.  After that, the root reads only its own cache.
+
 A cache that cannot be read is treated as empty.  A cache that cannot be
 written costs the next run the coverage runs again, and nothing else.
 
