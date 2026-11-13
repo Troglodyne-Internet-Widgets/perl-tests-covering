@@ -1,6 +1,6 @@
 Revision history for Perl-Tests-Covering
 
-0.003
+0.003 2026-11-13 TEODESIAN
     - A checkout with no cache of its own reads the cache of another
       checkout of its git repository, the main checkout first.  So a new
       worktree starts from the records of the checkout it came from, and
