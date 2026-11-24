@@ -1,4 +1,4 @@
-#!/usr/bin/env perl
+#!perl
 
 use 5.014;
 
@@ -23,9 +23,9 @@ the tests under Devel::Cover for real.
 
 =cut
 
-# Both import by being loaded, which ProhibitUnusedImports cannot see.
-use Test2::V1 -i;                 ## no critic (ProhibitUnusedImports)
-use Test2::Plugin::NoWarnings;    ## no critic (ProhibitUnusedImports)
+# This one imports by being loaded, which ProhibitUnusedImports cannot see.
+use Test2::V1 -i;    ## no critic (Perl::Critic::Policy::ProhibitUnusedImports)
+use Test2::Plugin::NoWarnings;
 use Test2::Tools::Exception qw{dies lives};
 use Test::MockModule        qw{strict};
 use Config                  ();
@@ -44,6 +44,18 @@ use WriteFile qw{write_file};
 
 use Perl::Tests::Covering ();
 
+# A read through an element, $h{a}{b}, makes $h{a} when it is missing.
+no autovivification;
+
+# The mocked coverage run reads %LOADS, %EXECUTED, %STATEMENTS and @RAN, and
+# each case sets them for the length of its own block.  local puts them back
+# when the block ends, which is what a case that fails halfway needs.
+## no critic (Perl::Critic::Policy::Variables::ProhibitLocalVars)
+
+# These cases test the private subs of the module, because the public ones
+# reach them only through a coverage run that the cases mock.
+## no critic (Perl::Critic::Policy::Subroutines::ProtectPrivateSubs)
+
 # What each test loads, besides itself, as the mocked coverage run reports it.
 our %LOADS;
 
@@ -60,7 +72,8 @@ $mock->redefine(
     _run_tests => sub {
         my ( $self, @tests ) = @_;
         push @RAN, @tests;
-        return { map { $_ => fake_record( $self->root(), $_ ) } @tests };
+        my $root = $self->root();
+        return { map { $_ => fake_record( $root, $_ ) } @tests };
     }
 );
 
@@ -69,7 +82,8 @@ sub fake_record {
     my ( $root, $test ) = @_;
 
     my %record = ( loaded => {}, executed => {}, versions => {} );
-    foreach my $rel ( grep { -e File::Spec->catfile( $root, $_ ) } $test, @{ $LOADS{$test} // [] } ) {
+    foreach my $rel ( $test, @{ $LOADS{$test} // [] } ) {
+        next if !-e File::Spec->catfile( $root, $rel );
         my $content = File::Slurper::read_binary( File::Spec->catfile( $root, $rel ) );
         my $blob    = $record{loaded}{$rel} = git_blob($content);
         next if !$STATEMENTS{$rel};
@@ -115,7 +129,11 @@ sub checkouts {
     write_file( $main, '.git/worktrees/wt/commondir', "../..\n" );
     write_file( $wt,   '.git',                        "gitdir: $main/.git/worktrees/wt\n" );
 
-    return map { Cwd::abs_path( dist( defined $sub ? "$_/$sub" : $_ ) ) } $main, $wt;
+    my @roots;
+    foreach my $checkout ( $main, $wt ) {
+        push @roots, Cwd::abs_path( dist( defined $sub ? "$checkout/$sub" : $checkout ) );
+    }
+    return @roots;
 }
 
 sub covering {
@@ -144,16 +162,16 @@ local %LOADS = (
 subtest new => sub {
     my $root = dist();
 
-    like( dies { Perl::Tests::Covering->new( root => $root, bogus => 1 ) },         qr/Unknown option\(s\).*bogus/, 'An option it does not know is an error, not ignored' );
-    like( dies { Perl::Tests::Covering->new( root => "$root/nonexistent-bogus" ) }, qr/No root/,                    'A root that does not exist is an error' );
+    like( dies { Perl::Tests::Covering->new( root => $root, bogus => 1 ) },         qr/Unknown[ ]option\(s\).*bogus/sx, 'An option it does not know is an error, not ignored' );
+    like( dies { Perl::Tests::Covering->new( root => "$root/nonexistent-bogus" ) }, qr/No[ ]root/sx,                    'A root that does not exist is an error' );
 
     foreach my $jobs ( 0, -1, 'x', '1.5', q{} ) {
-        like( dies { covering( $root, jobs => $jobs ) }, qr/jobs must be/, "jobs => '$jobs' is refused" );
+        like( dies { covering( $root, jobs => $jobs ) }, qr/jobs[ ]must[ ]be/sx, "jobs => '$jobs' is refused" );
     }
     ok( lives { covering( $root, jobs => 1 ) }, 'jobs => 1, the smallest, is accepted' ) or note($@);
 
-    like( dies { covering( $root, tests => 't' ) },        qr/tests must be a list/, 'tests as one string, not a list, is refused' );
-    like( dies { covering( $root, lib   => { a => 1 } ) }, qr/lib must be a list/,   'lib as a hash is refused' );
+    like( dies { covering( $root, tests => 't' ) },        qr/tests[ ]must[ ]be[ ]a[ ]list/sx, 'tests as one string, not a list, is refused' );
+    like( dies { covering( $root, lib   => { a => 1 } ) }, qr/lib[ ]must[ ]be[ ]a[ ]list/sx,   'lib as a hash is refused' );
 
     my ($found) = in_dir( "$root/lib", sub { Perl::Tests::Covering->new( cache_dir => "$root/.cache-bogus" )->root() } );
     is( $found, $root, 'With no root, the nearest directory above with a dist.ini is the root' );
@@ -165,7 +183,7 @@ subtest new => sub {
             dies {
                 in_dir( $bare, sub { Perl::Tests::Covering->new() } )
             },
-            qr/No root: no distribution above/,
+            qr/No[ ]root:[ ]no[ ]distribution[ ]above/sx,
             'With no root and none above, it says so'
         );
     }
@@ -351,7 +369,9 @@ END_FOO
 sub foo_dist {
     my $root = dist();
     write_file( $root, 'lib/Foo.pm', $FOO );
-    write_file( $root, "t/$_.t",     "1;\n" ) for qw{a b c d};
+    foreach my $name (qw{a b c d}) {
+        write_file( $root, "t/$name.t", "1;\n" );
+    }
     unlink "$root/t/deeper/c.t" or die $!;
     return $root;
 }
@@ -525,11 +545,11 @@ subtest tests_covering_diff => sub {
     is( $tests_for->( $root, $diff ), [qw{t/a.t t/d.t}], 'A test in the diff is chosen' );
 
     $root = foo_dist();
-    $diff = $diff_of->( $root, 15, 1, '        return $n + 2;' ) =~ s/index [0-9a-f]+/index 0123456/r;
+    $diff = $diff_of->( $root, 15, 1, '        return $n + 2;' ) =~ s/index[ ][\da-f]+/index 0123456/sxr;
     is( $tests_for->( $root, $diff ), [qw{t/a.t t/b.t t/c.t}], 'When the old side is not the version recorded, every test that loaded the file is chosen' );
 
     $root = foo_dist();
-    $diff = $diff_of->( $root, 15, 1, '        return $n + 2;' ) =~ s/^index .*\n//mr;
+    $diff = $diff_of->( $root, 15, 1, '        return $n + 2;' ) =~ s/^index[ ].*\n//msxr;
     is( $tests_for->( $root, $diff ), [qw{t/a.t t/b.t t/c.t}], 'and so when the diff does not say' );
 
     $root = foo_dist();
@@ -544,13 +564,13 @@ subtest tests_covering_diff => sub {
     $root = foo_dist();
     $diff = $diff_of->( $root, 1, 30 );
     unlink "$root/lib/Foo.pm" or die $!;
-    is( $tests_for->( $root, $diff =~ s{\+\+\+ b/lib/Foo.pm}{+++ /dev/null}r ), [qw{t/a.t t/b.t t/c.t}], 'and so does deleting it' );
+    is( $tests_for->( $root, $diff =~ s{\+\+\+[ ]b/lib/Foo[.]pm}{+++ /dev/null}sxr ), [qw{t/a.t t/b.t t/c.t}], 'and so does deleting it' );
 
     $root = foo_dist();
     $diff = $diff_of->( $root, 15, 1, '        return $n + 2;' );
     write_file( $root, 'lib/Foo.pm', $FOO );
-    is( $tests_for->( $root, $diff =~ s{lib/Foo.pm}{../elsewhere/Foo.pm}gr ), [], 'A file outside the root chooses none' );
-    is( $tests_for->( $root, q{} ),                                           [], 'nor does an empty diff' );
+    is( $tests_for->( $root, $diff =~ s{lib/Foo[.]pm}{../elsewhere/Foo.pm}gsxr ), [], 'A file outside the root chooses none' );
+    is( $tests_for->( $root, q{} ),                                               [], 'nor does an empty diff' );
 };
 
 subtest tests_covering_sub => sub {
@@ -565,19 +585,19 @@ subtest tests_covering_sub => sub {
         dies {
             foo_records( sub { covering($root)->tests_covering_sub( "$root/lib/Foo.pm", 'nonexistent_bogus' ) } )
         },
-        qr/No sub nonexistent_bogus in/,
+        qr/No[ ]sub[ ]nonexistent_bogus[ ]in/sx,
         'A sub that is not there is an error'
     );
-    like( dies { covering($root)->tests_covering_sub( '/bogus/Foo.pm',    'a' ) }, qr/is not under/,                       'and so is a file outside the root' );
-    like( dies { covering($root)->tests_covering_sub( "$root/lib/Foo.pm", q{} ) }, qr/needs a file and the name of a sub/, 'and so is an empty name' );
-    like( dies { covering($root)->tests_covering_sub() }, qr/needs a file and the name of a sub/, 'and so is no arguments' );
+    like( dies { covering($root)->tests_covering_sub( '/bogus/Foo.pm',    'a' ) }, qr/is[ ]not[ ]under/sx,                                   'and so is a file outside the root' );
+    like( dies { covering($root)->tests_covering_sub( "$root/lib/Foo.pm", q{} ) }, qr/needs[ ]a[ ]file[ ]and[ ]the[ ]name[ ]of[ ]a[ ]sub/sx, 'and so is an empty name' );
+    like( dies { covering($root)->tests_covering_sub() }, qr/needs[ ]a[ ]file[ ]and[ ]the[ ]name[ ]of[ ]a[ ]sub/sx, 'and so is no arguments' );
 };
 
 subtest files_covered_by => sub {
     my $root = foo_dist();
     is( [ foo_records( sub { covering($root)->files_covered_by("$root/t/a.t") } ) ],  [qw{lib/Foo.pm t/a.t}], 'The files a test loaded, itself too' );
     is( [ foo_records( sub { covering($root)->files_covered_by('/bogus/t/a.t') } ) ], [],                     'A test outside the root loaded nothing' );
-    like( dies { covering($root)->files_covered_by() }, qr/needs a test/, 'No test is an error' );
+    like( dies { covering($root)->files_covered_by() }, qr/needs[ ]a[ ]test/sx, 'No test is an error' );
 };
 
 subtest 'new, with a map' => sub {
@@ -598,13 +618,15 @@ subtest 'new, with a map' => sub {
 
     write_file( $root, 'maps/broken.pl', "sub {\n" );
     write_file( $root, 'maps/nocode.pl', "42;\n" );
-    like( dies { covering( $root, map => "$root/maps/broken.pl" ) },            qr/Cannot compile the map/,            'A map that does not compile is an error' );
-    like( dies { covering( $root, map => "$root/maps/nocode.pl" ) },            qr/returns something, not a code ref/, 'and so is one that returns no code reference' );
-    like( dies { covering( $root, map => "$root/maps/nonexistent-bogus.pl" ) }, qr/Cannot read the map/,               'and so is one that is not there' );
-    like( dies { covering( $root, map => [] ) },                                qr/map must be a code reference or/,   'and so is a map that is neither code nor a file' );
+    like( dies { covering( $root, map => "$root/maps/broken.pl" ) },            qr/Cannot[ ]compile[ ]the[ ]map/sx,                'A map that does not compile is an error' );
+    like( dies { covering( $root, map => "$root/maps/nocode.pl" ) },            qr/returns[ ]something,[ ]not[ ]a[ ]code[ ]ref/sx, 'and so is one that returns no code reference' );
+    like( dies { covering( $root, map => "$root/maps/nonexistent-bogus.pl" ) }, qr/Cannot[ ]read[ ]the[ ]map/sx,                   'and so is one that is not there' );
+    like( dies { covering( $root, map => [] ) },                                qr/map[ ]must[ ]be[ ]a[ ]code[ ]reference[ ]or/sx, 'and so is a map that is neither code nor a file' );
 
-    like( dies { covering( $root, unexplained => 'some' ) }, qr/unexplained must be none or all, not 'some'/, 'unexplained is none or all' );
-    ok( lives { covering( $root, unexplained => $_ ) }, "unexplained => '$_' is accepted" ) for qw{none all};
+    like( dies { covering( $root, unexplained => 'some' ) }, qr/unexplained[ ]must[ ]be[ ]none[ ]or[ ]all,[ ]not[ ]'some'/sx, 'unexplained is none or all' );
+    foreach my $value (qw{none all}) {
+        ok( lives { covering( $root, unexplained => $value ) }, "unexplained => '$value' is accepted" );
+    }
 };
 
 subtest 'tests_covering, with a map' => sub {
@@ -637,7 +659,10 @@ subtest 'tests_covering, with a map' => sub {
 
     my ( $got, $warned );
     $warned = warnings { $got = $template->( foo_dist(), map => $map_saying->( 't/nonexistent-bogus.t', '/bogus/abs' ), unexplained => 'all' ) };
-    like( $warned, [ qr/the map said 't\/nonexistent-bogus.t' for templates\/page.tt, which is neither a test nor a file/, qr/'\/bogus\/abs'/ ], 'A path that is neither a test nor a file is dropped with a warning' );
+    my $said    = qr{the[ ]map[ ]said[ ]'t/nonexistent-bogus[.]t'}sx;
+    my $about   = qr{for[ ]templates/page[.]tt}sx;
+    my $neither = qr{which[ ]is[ ]neither[ ]a[ ]test[ ]nor[ ]a[ ]file}sx;
+    like( $warned, [ qr/$said[ ]$about,[ ]$neither/sx, qr{'/bogus/abs'}sx ], 'A path that is neither a test nor a file is dropped with a warning' );
     is( $got, [qw{t/a.t t/b.t t/c.t t/d.t}], 'and leaves the file unexplained, not explained away' );
 
     @asked = ();
@@ -650,7 +675,7 @@ subtest 'tests_covering, with a map' => sub {
         dies {
             $template->( foo_dist(), map => sub { die "no idea\n" } )
         },
-        qr/no idea/,
+        qr/no[ ]idea/sx,
         'A map that dies makes the question die'
     );
     is( Cwd::getcwd(), $cwd, 'with the working directory put back' );
@@ -667,7 +692,6 @@ subtest 'tests_covering_diff, with a map' => sub {
     foo_records( sub { covering($root)->refresh() } );
 
     my @asked;
-    my $map = sub { my ( $path, $change ) = @_; push @asked, [ $path, $change ]; return 't/d.t' };
 
     my $diff = change_lines( $root, 'templates/page.tt', 2, 1, '[%# a better comment %]' );
     is(
@@ -675,7 +699,11 @@ subtest 'tests_covering_diff, with a map' => sub {
             in_dir(
                 $root,
                 sub {
-                    foo_records( sub { covering( $root, map => $map )->tests_covering_diff($diff) } );
+                    foo_records(
+                        sub {
+                            covering( $root, map => sub { my ( $path, $change ) = @_; push @asked, [ $path, $change ]; return 't/d.t' } )->tests_covering_diff($diff);
+                        }
+                    );
                 }
             )
         ],
@@ -724,24 +752,26 @@ subtest 'tests_covering_diff, with a map' => sub {
     # with it: nothing in the diff uses the plugin.
     my $plugin_diff = sub {
         my ( $dir, @files ) = @_;
-        write_file( $dir, $_, "1;\n" ) for @files;
+        foreach my $file (@files) {
+            write_file( $dir, $file, "1;\n" );
+        }
         return join q{}, map { "diff --git a/$_ b/$_\nnew file mode 100644\nindex 0000000..1234567\n--- /dev/null\n+++ b/$_\n\@\@ -0,0 +1 \@\@\n+1;\n" } @files;
     };
     my $chosen_with = sub {
-        my ( $dir, $diff, %opts ) = @_;
+        my ( $dir, $text, %opts ) = @_;
         return [
             in_dir(
                 $dir,
                 sub {
-                    foo_records( sub { covering( $dir, unexplained => 'all', %opts )->tests_covering_diff($diff) } );
+                    foo_records( sub { covering( $dir, unexplained => 'all', %opts )->tests_covering_diff($text) } );
                 }
             )
         ];
     };
     my $plugins = sub {
         my ($path) = @_;
-        return 'lib/Foo.pm'            if $path =~ m{\Alib/Foo/Plugin/.+[.]pm\z};
-        return 'lib/Foo/Plugin/New.pm' if $path =~ m{\Atemplates/plugin/New[.]tt\z};
+        return 'lib/Foo.pm'            if $path =~ m{\A lib/Foo/Plugin/.+ [.]pm \z}sx;
+        return 'lib/Foo/Plugin/New.pm' if $path eq 'templates/plugin/New.tt';
         return;
     };
 
@@ -755,7 +785,7 @@ subtest 'tests_covering_diff, with a map' => sub {
     my $warned = warnings {
         $got = $chosen_with->( $root, $diff, map => sub { return 'nonexistent-bogus.pm' } )
     };
-    like( $warned, [qr/the map said 'nonexistent-bogus.pm'/], 'An added Perl file the map says something wrong about is warned about' );
+    like( $warned, [qr/the[ ]map[ ]said[ ]'nonexistent-bogus[.]pm'/sx], 'An added Perl file the map says something wrong about is warned about' );
     is( $got, [qw{t/a.t t/b.t t/c.t t/d.t}], 'and is unexplained' );
 
     $root = foo_dist();
@@ -829,18 +859,21 @@ subtest _cover_switch => sub {
     write_file( $odd, 'dist.ini', q{} );
 
     my $switch = covering($odd)->_cover_switch('/bogus/db');
-    unlike( $switch, qr/[\s]/, 'No whitespace in the switch, since perl splits PERL5OPT on it' );
-    my ($opts) = $switch =~ m/\A-MDevel::Cover=(.*)\z/ or die "Not a Devel::Cover switch: $switch";
-    my %opts   = split q{,}, $opts;
+    unlike( $switch, qr/\s/sx, 'No whitespace in the switch, since perl splits PERL5OPT on it' );
+    my $prefix = '-MDevel::Cover=';
+    die "Not a Devel::Cover switch: $switch" if index( $switch, $prefix ) != 0;
+    my %opts = split m/,/sx, substr $switch, length $prefix;
     is( $opts{-db}, '/bogus/db', 'Splitting on commas finds the database whole' );
 
-    my $select = qr/$opts{-select}/;
+    # Compiled as Devel::Cover compiles it, without /x, since that is what the
+    # escapes in it have to survive.
+    my $select = qr/$opts{-select}/s;    ## no critic (Perl::Critic::Policy::RegularExpressions::RequireExtendedFormatting)
     my $real   = Cwd::abs_path($odd);
     like( "$real/lib/Foo.pm", $select, 'The pattern selects a file under a root with a comma and a space in it' );
     like( 'lib/Foo.pm',       $select, 'and a relative one' );
     unlike( '/bogus/lib/Foo.pm', $select, 'but not one under some other root' );
 
-    like( dies { covering($odd)->_cover_switch('/bogus/a,b') }, qr/comma or a space/, 'A database directory with a comma in it is refused, not mangled' );
+    like( dies { covering($odd)->_cover_switch('/bogus/a,b') }, qr/comma[ ]or[ ]a[ ]space/sx, 'A database directory with a comma in it is refused, not mangled' );
 };
 
 done_testing();
