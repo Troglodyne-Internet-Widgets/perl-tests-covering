@@ -1,4 +1,4 @@
-#!/usr/bin/env perl
+#!perl
 
 use 5.014;
 
@@ -20,8 +20,8 @@ is slow next to the rest, so it runs only with C<RELEASE_TESTING=1>.
 =cut
 
 # Both import by being loaded, which ProhibitUnusedImports cannot see.
-use Test2::V1 -i;                 ## no critic (ProhibitUnusedImports)
-use Test2::Plugin::NoWarnings;    ## no critic (ProhibitUnusedImports)
+use Test2::V1 -i;    ## no critic (Perl::Critic::Policy::ProhibitUnusedImports)
+use Test2::Plugin::NoWarnings;
 use Capture::Tiny       qw{capture};
 use Cwd                 ();
 use File::Slurper       ();

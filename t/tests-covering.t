@@ -1,4 +1,4 @@
-#!/usr/bin/env perl
+#!perl
 
 use 5.014;
 
@@ -19,19 +19,22 @@ C<tests_covering> answers from a fixed list, so no test runs under coverage.
 =cut
 
 # Both import by being loaded, which ProhibitUnusedImports cannot see.
-use Test2::V1 -i;                 ## no critic (ProhibitUnusedImports)
-use Test2::Plugin::NoWarnings;    ## no critic (ProhibitUnusedImports)
+use Test2::V1 -i;    ## no critic (Perl::Critic::Policy::ProhibitUnusedImports)
+use Test2::Plugin::NoWarnings;
 use Test2::Tools::Exception qw{lives};
 use Test2::Tools::Warnings  qw{warnings};
 use Test::MockModule        qw{strict};
 use Capture::Tiny           qw{capture};
 use Cwd                     ();
+use File::Spec              ();
 use File::Temp              qw{tempdir};
 
 use FindBin::libs;
 use FindBin ();
 
-ok( lives { require "$FindBin::Bin/../bin/tests-covering" }, "bin/tests-covering loads as a module" ) or bail_out("bin/tests-covering does not load: $@");
+# A script has no bareword name to require it by.
+my $script = File::Spec->catfile( $FindBin::Bin, File::Spec->updir(), 'bin', 'tests-covering' );
+ok( lives { require $script }, "bin/tests-covering loads as a module" ) or bail_out("bin/tests-covering does not load: $@");
 
 my $root = Cwd::abs_path( tempdir( CLEANUP => 1 ) );
 mkdir "$root/t" or die $!;
@@ -60,13 +63,19 @@ $mock->redefine( tests_covering_sub  => sub { shift; push @calls, [ sub  => @_ ]
 $mock->redefine( files_covered_by    => sub { shift; push @calls, [ by   => @_ ]; return qw{lib/Foo.pm t/a.t} } );
 $mock->redefine( refresh             => sub { push @calls, ['refresh']; return 't/a.t' } );
 
+# A handle that reads $text.
+sub string_handle {
+    my ($text) = @_;
+    open my $fh, '<', \$text or die $!;
+    return $fh;
+}
+
 # main(@argv), with STDIN reading $stdin, run from $dir.  Returns the exit code,
 # what it printed and what it warned.
 sub run_main {
     my ( $dir, $stdin, @argv ) = @_;
 
-    open my $in, '<', \$stdin or die $!;
-    local *STDIN = $in;
+    local *STDIN = string_handle($stdin);
     my $was = Cwd::getcwd();
     chdir $dir or die "Cannot chdir to $dir: $!";
     my $code;
@@ -103,19 +112,19 @@ subtest main => sub {
 
     my ( $both, $both_out );
     my $warned = warnings { ( $both, $both_out ) = run_main( $root, q{}, qw{--map /bogus/map.pl --no-map x} ) };
-    like( $warned, [qr/Give --map or --no-map, not both/], '--map with --no-map is refused, and says why' );
+    like( $warned, [qr/Give[ ]--map[ ]or[ ]--no-map,[ ]not[ ]both/sx], '--map with --no-map is refused, and says why' );
     is( [ $both, $both_out ], [ 2, q{} ], 'with exit 2' );
 
     my ( $bad, $bad_out, $bad_err );
     my $warnings = warnings { ( $bad, $bad_out, $bad_err ) = run_main( $root, q{}, qw{--bogus} ) };
-    like( $warnings, [qr/Unknown option: bogus/], 'An option it does not know is named in a warning' );
+    like( $warnings, [qr/Unknown[ ]option:[ ]bogus/sx], 'An option it does not know is named in a warning' );
     is( $bad,     2,   'and exits 2' );
     is( $bad_out, q{}, 'and prints nothing where the tests would go' );
-    like( $bad_err, qr/tests-covering \[options\] FILE/, 'but prints the synopsis to STDERR' );
+    like( $bad_err, qr/tests-covering[ ]\[options\][ ]FILE/sx, 'but prints the synopsis to STDERR' );
 
     my ( $help, $help_out ) = run_main( $root, q{}, qw{--help} );
     is( $help, 0, '--help exits 0' );
-    like( $help_out, qr/--cache-dir DIR/, 'and prints the options to STDOUT' );
+    like( $help_out, qr/--cache-dir[ ]DIR/sx, 'and prints the options to STDOUT' );
 };
 
 subtest 'main, in each mode' => sub {
@@ -141,11 +150,11 @@ subtest 'main, in each mode' => sub {
     is( $out,    q{},             'and prints nothing, not even the tests it ran' );
 
     foreach my $case (
-        [ [qw{--diff --refresh}],     qr/Give one of/,              'Two modes' ],
-        [ [qw{--diff lib/Foo.pm}],    qr/--diff takes no files/,    '--diff with a file' ],
-        [ [qw{--refresh lib/Foo.pm}], qr/--refresh takes no files/, '--refresh with a file' ],
-        [ [qw{--sub up}],             qr/exactly one file/,         '--sub with no file' ],
-        [ [qw{--sub up a.pm b.pm}],   qr/exactly one file/,         '--sub with two' ],
+        [ [qw{--diff --refresh}],     qr/Give[ ]one[ ]of/sx,                'Two modes' ],
+        [ [qw{--diff lib/Foo.pm}],    qr/--diff[ ]takes[ ]no[ ]files/sx,    '--diff with a file' ],
+        [ [qw{--refresh lib/Foo.pm}], qr/--refresh[ ]takes[ ]no[ ]files/sx, '--refresh with a file' ],
+        [ [qw{--sub up}],             qr/exactly[ ]one[ ]file/sx,           '--sub with no file' ],
+        [ [qw{--sub up a.pm b.pm}],   qr/exactly[ ]one[ ]file/sx,           '--sub with two' ],
     ) {
         my ( $argv, $says, $what ) = @$case;
         @calls = ();
@@ -157,8 +166,8 @@ subtest 'main, in each mode' => sub {
 };
 
 subtest read_names => sub {
-    open my $fh, '<', \"a\nb\r\n\n\nc" or die $!;
-    is( [ Perl::Tests::Covering::Script::read_names($fh) ], [qw{a b c}], 'One name a line, with the line end and the blank lines dropped' );
+    my @names = Perl::Tests::Covering::Script::read_names( string_handle("a\nb\r\n\n\nc") );
+    is( \@names, [qw{a b c}], 'One name a line, with the line end and the blank lines dropped' );
 };
 
 done_testing();

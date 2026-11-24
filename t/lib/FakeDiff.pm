@@ -37,7 +37,7 @@ sub change_lines {
 
     my $path  = File::Spec->catfile( $root, $rel );
     my $old   = File::Slurper::read_binary($path);
-    my @lines = split m/^/, $old;
+    my @lines = split m/^/msx, $old;
     my @gone  = splice @lines, $line - 1, $count, map { "$_\n" } @new;
     my $new   = join q{}, @lines;
     File::Slurper::Temp::write_binary( $path, $new );

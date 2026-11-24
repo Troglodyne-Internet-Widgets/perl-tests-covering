@@ -5,6 +5,7 @@ runtime:
     Carp: '0'
     Config: '0'
     Cpanel::JSON::XS: '0'
+    autovivification: '0'
     Cwd: '0'
     Devel::Cover: '1.52'
     Digest::MD5: '0'

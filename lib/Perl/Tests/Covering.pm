@@ -9,6 +9,10 @@ use warnings FATAL => 'all';
 
 use re '/aa';
 
+# A read through an element, $h{a}{b}, makes $h{a} when it is missing, and the
+# records and the cache here are walked a level at a time.
+no autovivification;
+
 use Readonly;
 
 use Carp                             ();
@@ -387,7 +391,7 @@ Readonly::Scalar my $CACHE_FORMAT => 2;
 Readonly::Scalar my $CACHE_NAME => 'perl-tests-covering';
 
 # What this module names the files in its cache directory.
-Readonly::Scalar my $CACHE_FILE_RX => qr/\A[0-9a-f]{40}[.]json[.]gz\z/;
+Readonly::Scalar my $CACHE_FILE_RX => qr/\A[\da-f]{40}[.]json[.]gz\z/sx;
 
 # The files that say a directory is the root of a distribution.
 Readonly::Array my @DIST_MARKERS => qw{dist.ini Makefile.PL Build.PL cpanfile META.json .git};
@@ -401,7 +405,7 @@ Readonly::Scalar my $EXEC_FAILED => 127;
 # The directory this module was loaded from, so that a run can load the
 # recorder from the same place.  Taken now, because __FILE__ may be relative to
 # the directory we started in.
-Readonly::Scalar my $OWN_LIB => File::Spec->rel2abs(__FILE__) =~ s{[/\\]Perl[/\\]Tests[/\\]Covering[.]pm\z}{}r;
+Readonly::Scalar my $OWN_LIB => File::Spec->rel2abs(__FILE__) =~ s{ [/\\] Perl [/\\] Tests [/\\] Covering [.] pm \z }{}sxr;
 
 =head1 CONSTRUCTOR
 
@@ -470,10 +474,10 @@ sub new {
     }
 
     my $jobs = $opts{jobs} // 1;
-    Carp::croak("jobs must be a whole number of 1 or more, not '$jobs'") if $jobs !~ m/\A[1-9][0-9]*\z/;
+    Carp::croak("jobs must be a whole number of 1 or more, not '$jobs'") if $jobs !~ m/\A[1-9]\d*\z/sx;
 
     my $unexplained = $opts{unexplained} // 'none';
-    Carp::croak("unexplained must be none or all, not '$unexplained'") if $unexplained !~ m/\A(?:none|all)\z/;
+    Carp::croak("unexplained must be none or all, not '$unexplained'") if $unexplained ne 'none' && $unexplained ne 'all';
 
     my $self = bless {
         root        => $root,
@@ -498,7 +502,10 @@ The absolute path of the root, with symbolic links resolved.
 
 =cut
 
-sub root { return $_[0]{root} }
+sub root {
+    my ($self) = @_;
+    return $self->{root};
+}
 
 =head2 tests
 
@@ -510,10 +517,18 @@ sub tests {
     my ($self) = @_;
 
     my @tests;
-    foreach my $dir ( grep { -d } map { File::Spec->catdir( $self->{root}, $_ ) } @{ $self->{tests} } ) {
-        File::Find::find( { no_chdir => 1, wanted => sub { push @tests, $File::Find::name if m/[.]t\z/ && -e && !-d } }, $dir );
+    foreach my $name ( @{ $self->{tests} } ) {
+        my $dir = File::Spec->catdir( $self->{root}, $name );
+        next if !-d $dir;
+        File::Find::find( { no_chdir => 1, wanted => sub { push @tests, $File::Find::name if m/[.]t\z/sx && -e && !-d } }, $dir );
     }
-    return sort map { File::Spec->abs2rel( $_, $self->{root} ) } @tests;
+
+    my @relative;
+    foreach my $test (@tests) {
+        push @relative, File::Spec->abs2rel( $test, $self->{root} );
+    }
+    my @sorted = sort @relative;
+    return @sorted;
 }
 
 =head2 refresh
@@ -553,7 +568,7 @@ sub refresh {
         $after{$test} = $ran->{$test};
     }
 
-    my $changed = $cache->{borrowed} || @stale || grep { !$after{$_} } keys %$before;
+    my $changed = $cache->{borrowed} || @stale || List::Util::any { !$after{$_} } keys %$before;
     $self->_write_cache( \%after, $versions ) if $changed;
 
     $self->{before}   = $before;
@@ -581,15 +596,23 @@ L</A FILE THAT CHANGED OR IS GONE>.
 sub tests_covering {
     my ( $self, @files ) = @_;
 
-    my @wanted = grep { defined } map { $self->_relative( $_, Cwd::getcwd() ) } @files;
+    my @wanted;
+    foreach my $file (@files) {
+        my $rel = $self->_relative( $file, Cwd::getcwd() );
+        push @wanted, $rel if defined $rel;
+    }
     $self->refresh();
 
-    my @records  = ( $self->{before}, $self->{after} );
-    my %covering = map { $_ => 1 } map { _loaders( $_, @records ) } @wanted;
+    my @records = @{$self}{qw{before after}};
+    my %covering;
+    foreach my $rel (@wanted) {
+        $covering{$_} = 1 for _loaders( $rel, @records );
+    }
     $covering{$_} = 1 for $self->_unexplained_tests( \@wanted, \@records, {} );
 
     # A test that is gone covers nothing it could be run for.
-    return sort grep { $self->{after}{$_} } keys %covering;
+    my @sorted = sort grep { $self->{after}{$_} } keys %covering;
+    return @sorted;
 }
 
 =head2 tests_covering_diff
@@ -612,15 +635,23 @@ sub tests_covering_diff {
     my ( $self, $diff ) = @_;
 
     $self->{blob} = {};
-    my $cache   = $self->_read_cache();
-    my $cwd     = Cwd::getcwd();
-    my @changes = map { $self->_resolve_change( $_, $cwd ) } _parse_diff($diff);
+    my $cache = $self->_read_cache();
+    my $cwd   = Cwd::getcwd();
+    my @changes;
+    foreach my $parsed ( _parse_diff($diff) ) {
+        push @changes, $self->_resolve_change( $parsed, $cwd );
+    }
     my %in_diff = map { $_ => 1 } grep { defined } map { @{$_}{qw{old new}} } @changes;
 
     my %chosen;
     foreach my $test ( $self->tests() ) {
         my $record = $cache->{tests}{$test};
-        $chosen{$test} = 1 if $in_diff{$test} || !$self->_record_holds( $record, \%in_diff ) || grep { $self->_change_reaches( $_, $record, $cache->{versions} ) } @changes;
+        my $chose  = $in_diff{$test} || !$self->_record_holds( $record, \%in_diff );
+        foreach my $change (@changes) {
+            last if $chose;
+            $chose = $self->_change_reaches( $change, $record, $cache->{versions} );
+        }
+        $chosen{$test} = 1 if $chose;
     }
 
     # A Perl file that is new in the diff is usually reached through the files
@@ -631,7 +662,8 @@ sub tests_covering_diff {
         $quiet{ $change->{new} } = 1 if !defined $change->{old} && defined $change->{new} && $self->_is_perl( $change->{new} );
     }
     $chosen{$_} = 1 for $self->_unexplained_tests( [ sort keys %change_of ], [ $cache->{tests} ], \%change_of, \%quiet );
-    return sort keys %chosen;
+    my @sorted = sort keys %chosen;
+    return @sorted;
 }
 
 =head2 tests_covering_sub
@@ -650,19 +682,20 @@ file at all, as L</tests_covering> would.
 sub tests_covering_sub {
     my ( $self, $file, $name ) = @_;
 
-    Carp::croak('tests_covering_sub needs a file and the name of a sub') if !defined $file || !defined $name || !length $name;
+    Carp::croak('tests_covering_sub needs a file and the name of a sub') if !$file || !$name;
     my $rel = $self->_relative( $file, Cwd::getcwd() ) // Carp::croak("$file is not under ${\ $self->root() }");
     $self->refresh();
 
     my $content = eval { File::Slurper::read_binary( File::Spec->catfile( $self->{root}, $rel ) ) } // Carp::croak("Cannot read $file: $@");
-    my @starts  = _sub_lines( $content, $name =~ s/\A.*:://r );
+    my @starts  = _sub_lines( $content, $name =~ s/\A.*:://sxr );
     Carp::croak("No sub $name in $file") if !@starts;
 
-    my $blob = _git_blob($content);
-    return sort grep {
+    my $blob   = _git_blob($content);
+    my @sorted = sort grep {
         my $record = $self->{after}{$_};
         defined $record->{loaded}{$rel} && _touches( $self->{versions}{$blob}, $record->{executed}{$rel}, \@starts, [] )
     } keys %{ $self->{after} };
+    return @sorted;
 }
 
 =head2 files_covered_by
@@ -681,7 +714,8 @@ sub files_covered_by {
     Carp::croak('files_covered_by needs a test') if !defined $test;
     my $rel = $self->_relative( $test, Cwd::getcwd() ) // return;
     $self->refresh();
-    return sort keys %{ $self->{after}{$rel}{loaded} // {} };
+    my @sorted = sort keys %{ $self->{after}{$rel}{loaded} // {} };
+    return @sorted;
 }
 
 # The tests whose record, in any of @records, names $file as loaded.
@@ -708,7 +742,10 @@ sub _unexplained_tests {
         $chosen{$_} = 1 for @reached;
         $unexplained ||= !( @reached || $answer->{none} || ( $quiet->{$path} && !$answer->{said} ) );
     }
-    return sort keys %tests if $unexplained && $self->{unexplained} eq 'all';
+    if ( $unexplained && $self->{unexplained} eq 'all' ) {
+        my @all = sort keys %tests;
+        return @all;
+    }
     return grep { $tests{$_} } sort keys %chosen;
 }
 
@@ -775,7 +812,7 @@ sub _in_root {
 
     my $was = Cwd::getcwd();
     chdir $self->{root} or Carp::croak("Cannot chdir to $self->{root}: $!");
-    local @INC = ( ( map { File::Spec->rel2abs( $_, $self->{root} ) } @{ $self->{lib} } ), @INC );
+    local @INC = ( $self->_lib_dirs(), @INC );
     my @got = eval { $code->() };
     my $err = $@;
     chdir $was or Carp::croak("Cannot chdir back to $was: $!");
@@ -783,12 +820,23 @@ sub _in_root {
     return @got;
 }
 
+# The library directories of the distribution, as absolute paths.
+sub _lib_dirs {
+    my ($self) = @_;
+
+    my @dirs;
+    foreach my $dir ( @{ $self->{lib} } ) {
+        push @dirs, File::Spec->rel2abs( $dir, $self->{root} );
+    }
+    return @dirs;
+}
+
 # Whether a file relative to the root is Perl: by its name, or by a #! line
 # that names perl.
 sub _is_perl {
     my ( $self, $rel ) = @_;
-    return 1 if $rel =~ m/[.](?:pm|pl|PL|t)\z/;
-    return ( _first_line( File::Spec->catfile( $self->{root}, $rel ) ) // q{} ) =~ m/\A#!.*\bperl/;
+    return 1 if $rel =~ m/[.](?:pm|pl|PL|t)\z/sx;
+    return ( _first_line( File::Spec->catfile( $self->{root}, $rel ) ) // q{} ) =~ m/\A \#! .* \bperl/sx;
 }
 
 # The nearest directory, from $dir upwards, that holds a distribution.
@@ -799,7 +847,9 @@ sub _find_root {
     my @dirs = File::Spec->splitdir($directories);
     while (@dirs) {
         my $candidate = File::Spec->catpath( $volume, File::Spec->catdir(@dirs), q{} );
-        return Cwd::abs_path($candidate) if grep { -e File::Spec->catfile( $candidate, $_ ) } @DIST_MARKERS;
+        foreach my $marker (@DIST_MARKERS) {
+            return Cwd::abs_path($candidate) if -e File::Spec->catfile( $candidate, $marker );
+        }
         pop @dirs;
     }
     return;
@@ -893,7 +943,7 @@ sub _spawn {
     my $loaded = File::Spec->catdir( $tmp, 'loaded' );
     mkdir $loaded or Carp::croak("Cannot make $loaded: $!");
 
-    my @lib  = ( ( map { File::Spec->rel2abs( $_, $self->{root} ) } @{ $self->{lib} } ), _split_path( $ENV{PERL5LIB} ), $OWN_LIB );
+    my @lib  = ( $self->_lib_dirs(), _split_path( $ENV{PERL5LIB} ), $OWN_LIB );
     my @opt  = ( $self->_cover_switch( File::Spec->catdir( $tmp, 'cover_db' ) ), '-MPerl::Tests::Covering::Recorder' );
     my @perl = ( $^X, $self->_taint_switches( $test, \@lib, \@opt ), $test );
 
@@ -909,14 +959,15 @@ sub _spawn {
     open STDERR, '>&', \*STDOUT or POSIX::_exit($EXEC_FAILED);
 
     # A perl that a tainted test starts is not tainted, and reads these.
-    $ENV{PERL5LIB}                   = join $Config::Config{path_sep}, @lib;
-    $ENV{PERL5OPT}                   = join q{ }, @opt, grep { defined && length } $ENV{PERL5OPT};
-    $ENV{PERL_TESTS_COVERING_LOADED} = $loaded;
-    $ENV{HARNESS_ACTIVE}             = 1;
+    # The child never returns, so nothing restores these: exec carries them on.
+    local $ENV{PERL5LIB}                   = join $Config::Config{path_sep}, @lib;
+    local $ENV{PERL5OPT}                   = join q{ }, @opt, grep { $_ } $ENV{PERL5OPT};
+    local $ENV{PERL_TESTS_COVERING_LOADED} = $loaded;
+    local $ENV{HARNESS_ACTIVE}             = 1;
 
     # A list exec of perl itself, with no shell in between.
     { no warnings 'exec'; exec {$^X} @perl }    ## no critic (ProhibitShellDispatch)
-    POSIX::_exit($EXEC_FAILED);
+    return POSIX::_exit($EXEC_FAILED);
 }
 
 # The switches that go before the test on perl's command line: none, unless its
@@ -935,14 +986,15 @@ sub _first_line {
 
     open my $fh, '<', $path or return;
     my $line = <$fh>;
-    close $fh;
+    close $fh or return;
     return $line;
 }
 
 # The directories in a PATH-like list, without the empty ones.
 sub _split_path {
     my ($list) = @_;
-    return grep { length } split m/\Q$Config::Config{path_sep}\E/, $list // q{};
+    my $separator = $Config::Config{path_sep};
+    return grep { $_ } split m/\Q$separator\E/sx, $list // q{};
 }
 
 # The -MDevel::Cover switch for one run.  Devel::Cover splits its options on
@@ -953,8 +1005,8 @@ sub _split_path {
 sub _cover_switch {
     my ( $self, $db ) = @_;
 
-    ( my $root = quotemeta $self->{root} ) =~ s/\\([,\s])/sprintf '\\x%02x', ord $1/ge;
-    Carp::croak("Cannot put a temporary directory with a comma or a space in it in PERL5OPT: $db") if $db =~ m/[,\s]/;
+    ( my $root = quotemeta $self->{root} ) =~ s/\\([,\s])/sprintf '\\x%02x', ord $1/gesx;
+    Carp::croak("Cannot put a temporary directory with a comma or a space in it in PERL5OPT: $db") if $db =~ m/[,\s]/sx;
     return "-MDevel::Cover=-db,$db,-silent,1,-coverage,statement,-select,^(?!/)|^$root/";
 }
 
@@ -1031,7 +1083,10 @@ sub _files_recorded {
     my @files;
     foreach my $list ( _entries($loaded) ) {
         my @names = eval { File::Slurper::read_lines($list) } or next;
-        push @files, grep { defined } map { $self->_distribution_file( $_, $self->{root} ) } @names;
+        foreach my $name (@names) {
+            my $rel = $self->_distribution_file( $name, $self->{root} );
+            push @files, $rel if defined $rel;
+        }
     }
     return @files;
 }
@@ -1041,8 +1096,11 @@ sub _entries {
     my ($dir) = @_;
 
     opendir my $dh, $dir or return;
-    my @entries = map { File::Spec->catfile( $dir, $_ ) } grep { !m/\A[.]/ } readdir $dh;
-    closedir $dh;
+    my @entries;
+    foreach my $name ( grep { !m/\A[.]/sx } readdir $dh ) {
+        push @entries, File::Spec->catfile( $dir, $name );
+    }
+    closedir $dh or return;
     return @entries;
 }
 
@@ -1054,7 +1112,7 @@ sub _distribution_file {
     my $rel = $self->_relative( $name, $cwd ) // return;
 
     # A test run after `make` loads the copy in blib.
-    $rel =~ s{\Ablib/(?:lib|arch)/}{lib/} or $rel =~ s{\Ablib/script/}{bin/};
+    $rel =~ s{ \A blib/ (?:lib|arch) / }{lib/}sx or $rel =~ s{ \A blib/script/ }{bin/}sx;
     my $path = File::Spec->catfile( $self->{root}, $rel );
     return -e $path && !-d _ ? $rel : undef;
 }
@@ -1068,7 +1126,7 @@ sub _parse_diff {
     # Where the parse is: the changes so far, and in the hunk being read, the
     # next line on each side and how many are left.
     my %at = ( changes => [], old_left => 0, new_left => 0 );
-    foreach my $line ( split m/\r?\n/, $diff // q{} ) {
+    foreach my $line ( split m/\r?\n/sx, $diff // q{} ) {
         if ( $at{old_left} || $at{new_left} ) {
             _hunk_line( \%at, $line );
             next;
@@ -1105,23 +1163,24 @@ sub _header_line {
     my ( $at, $line ) = @_;
 
     my $changes = $at->{changes};
-    if ( $line =~ m/\Adiff --git (\S+) (\S+)\z/ ) {
+    if ( $line =~ m/\A diff [ ] --git [ ] (\S+) [ ] (\S+) \z/sx ) {
         push @$changes, { git => 1, old => _diff_path( $1, 1 ), new => _diff_path( $2, 1 ), blocks => [] };
         return;
     }
-    if ( $line =~ m/\Adiff / || ( $line =~ m/\A--- / && ( !@$changes || @{ $changes->[-1]{blocks} } ) ) ) {
+    if ( $line =~ m/\A diff [ ]/sx || ( $line =~ m/\A --- [ ]/sx && ( !@$changes || @{ $changes->[-1]{blocks} } ) ) ) {
         push @$changes, { blocks => [] };
     }
 
     my $change = $changes->[-1] or return;
-    if ( $line =~ m/\Aindex ([0-9a-f]+)[.][.]([0-9a-f]+)/ ) {
+    if ( $line =~ m/\A index [ ] ([\da-f]+) [.][.] ([\da-f]+)/sx ) {
         @{$change}{qw{old_blob new_blob}} = ( $1, $2 );
     }
-    elsif ( my ( $moved, $marked, $path ) = $line =~ m/\A(?:(?:rename|copy) (from|to)|(---|[+]{3})) (.+)\z/ ) {
-        my $side = ( $moved // $marked ) =~ m/\A(?:from|---)\z/ ? 'old' : 'new';
+    elsif ( my ( $moved, $marked, $path ) = $line =~ m/\A (?:(?:rename|copy) [ ] (from|to)|(---|[+]{3})) [ ] (.+) \z/sx ) {
+        my $which = $moved // $marked;
+        my $side  = $which eq 'from' || $which eq q{---} ? 'old' : 'new';
         $change->{$side} = _diff_path( $path, $marked && $change->{git} );
     }
-    elsif ( $line =~ m/\A\@\@ -(\d+)(?:,(\d+))? [+](\d+)(?:,(\d+))? \@\@/ ) {
+    elsif ( $line =~ m/\A \@\@ [ ] -(\d+) (?:,(\d+))? [ ] [+](\d+) (?:,(\d+))? [ ] \@\@/sx ) {
         @{$at}{qw{old old_left new new_left}} = ( $1, $2 // 1, $3, $4 // 1 );
 
         # An empty side is numbered by the line before it.
@@ -1145,15 +1204,15 @@ sub _new_block {
 sub _diff_path {
     my ( $path, $git ) = @_;
 
-    if ( $path =~ m/\A"(.*)"\z/s ) {
+    if ( $path =~ m/\A " (.*) " \z/sx ) {
         my %escape = ( n => "\n", t => "\t", q{"} => q{"}, q{\\} => q{\\} );
-        $path = $1 =~ s{\\([0-7]{3}|.)}{length $1 == 3 ? chr oct $1 : $escape{$1} // $1}gser;
+        $path = $1 =~ s{ \\ ([0-7]{3}|.) }{length $1 == 3 ? chr oct $1 : $escape{$1} // $1}gsxer;
     }
     else {
-        $path =~ s/\t.*\z//s;
+        $path =~ s/\t.*\z//sx;
     }
-    return                    if $path eq '/dev/null';
-    $path =~ s{\A[abciow]/}{} if $git;
+    return                          if $path eq '/dev/null';
+    $path =~ s{ \A [abciow] / }{}sx if $git;
     return $path;
 }
 
@@ -1163,7 +1222,9 @@ sub _resolve_change {
     my ( $self, $change, $cwd ) = @_;
 
     my %resolved = %$change;
-    $resolved{$_} = defined $change->{$_} ? $self->_relative( $change->{$_}, $cwd ) : undef for qw{old new};
+    foreach my $side (qw{old new}) {
+        $resolved{$side} = defined $change->{$side} ? $self->_relative( $change->{$side}, $cwd ) : undef;
+    }
     return \%resolved;
 }
 
@@ -1191,7 +1252,7 @@ sub _change_reaches {
 
         # Code in place of nothing but comments, blank lines and POD goes in
         # between the lines around it.
-        push @gaps, $block->{at} if !@code && grep { !$new_inert{$_} } @{ $block->{added} };
+        push @gaps, $block->{at} if !@code && List::Util::any { !$new_inert{$_} } @{ $block->{added} };
     }
     return _touches( $version, $record->{executed}{$old}, \@lines, \@gaps );
 }
@@ -1226,7 +1287,7 @@ sub _touches {
         my ( $from, $to, $is_gap ) = @$range;
         my $span     = _innermost( $version->{spans}, $from, $to ) or return 1;
         my @measured = !$is_gap && $known{ $span->[0] } ? ( $span->[0] ) : grep { $known{$_} } $span->[0] .. $span->[1];
-        return 1 if !@measured || grep { $ran{$_} } @measured;
+        return 1 if !@measured || List::Util::any { $ran{$_} } @measured;
     }
     return 0;
 }
@@ -1251,11 +1312,15 @@ sub _layout {
     my ($content) = @_;
 
     my $doc   = _ppi($content) or return;
-    my @lines = split qq{\n}, $content, -1;
+    my @lines = split m/\n/sx, $content, -1;
 
     # What PPI calls a statement inside parentheses or brackets is part of the
     # statement around it, and Devel::Cover counts that one.
-    my @statements = grep { my $parent = $_->parent(); !$parent->isa('PPI::Structure') || $parent->isa('PPI::Structure::Block') } @{ $doc->find('PPI::Statement') || [] };
+    my @statements;
+    foreach my $candidate ( @{ $doc->find('PPI::Statement') || [] } ) {
+        my $parent = $candidate->parent();
+        push @statements, $candidate if !$parent->isa('PPI::Structure') || $parent->isa('PPI::Structure::Block');
+    }
 
     my @spans;
     foreach my $statement (@statements) {
@@ -1274,7 +1339,7 @@ sub _layout {
             $inert{$_} = 1 for @span;
         }
         elsif ( $token->isa('PPI::Token::Whitespace') || $token->isa('PPI::Token::Comment') ) {
-            $inert{$_} = 1 for grep { ( $lines[ $_ - 1 ] // q{} ) =~ m/\A\s*(?:#.*)?\z/ } @span;
+            $inert{$_} = 1 for grep { ( $lines[ $_ - 1 ] // q{} ) =~ m/\A \s* (?: \#.* )? \z/sx } @span;
         }
     }
     return { spans => \@spans, inert => [ sort { $a <=> $b } keys %inert ] };
@@ -1285,7 +1350,11 @@ sub _sub_lines {
     my ( $content, $name ) = @_;
 
     my $doc = _ppi($content) or return;
-    return map { $_->line_number() } grep { ( $_->name() // q{} ) =~ m/\A(?:.*::)?\Q$name\E\z/ } @{ $doc->find('PPI::Statement::Sub') || [] };
+    my @starts;
+    foreach my $sub ( @{ $doc->find('PPI::Statement::Sub') || [] } ) {
+        push @starts, $sub->line_number() if ( $sub->name() // q{} ) =~ m/\A (?:.*::)? \Q$name\E \z/sx;
+    }
+    return @starts;
 }
 
 sub _ppi {
@@ -1300,7 +1369,7 @@ sub _ppi {
 sub _last_line {
     my ($token) = @_;
     my $content = $token->content();
-    return $token->line_number() + ( $content =~ tr/\n// ) - ( $content =~ m/\n\z/ ? 1 : 0 );
+    return $token->line_number() + ( $content =~ tr/\n// ) - ( $content =~ m/\n\z/sx ? 1 : 0 );
 }
 
 # The cache file of $root, by default the root of this object.
@@ -1359,7 +1428,7 @@ sub _other_checkouts {
     my ($self) = @_;
 
     my $top = $self->{root};
-    until ( -e File::Spec->catfile( $top, '.git' ) ) {
+    while ( !-e File::Spec->catfile( $top, '.git' ) ) {
         my $up = File::Basename::dirname($top);
         return if $up eq $top;
         $top = $up;
@@ -1368,20 +1437,26 @@ sub _other_checkouts {
 
     # The directory above the common directory is a checkout unless the
     # repository is bare.
-    my @tops = grep { -e File::Spec->catfile( $_, '.git' ) } File::Basename::dirname($common);
-    my $list = File::Spec->catdir( $common, 'worktrees' );
+    my $above = File::Basename::dirname($common);
+    my @tops  = -e File::Spec->catfile( $above, '.git' ) ? ($above) : ();
+    my $list  = File::Spec->catdir( $common, 'worktrees' );
     if ( opendir( my $dh, $list ) ) {
-        foreach my $name ( sort grep { !m/\A[.]/ } readdir $dh ) {
+        foreach my $name ( sort grep { !m/\A[.]/sx } readdir $dh ) {
             my $dotgit = _first_line( File::Spec->catfile( $list, $name, 'gitdir' ) ) // next;
             chomp $dotgit;
             push @tops, File::Basename::dirname($dotgit);
         }
-        closedir $dh;
+        closedir $dh or return;
     }
 
     my $rel  = File::Spec->abs2rel( $self->{root}, $top );
     my %seen = ( $self->{root} => 1 );
-    return grep { -d && !$seen{$_}++ } map { Cwd::abs_path( File::Spec->catdir( $_, $rel ) ) // () } @tops;
+    my @others;
+    foreach my $checkout (@tops) {
+        my $other = Cwd::abs_path( File::Spec->catdir( $checkout, $rel ) ) // next;
+        push @others, $other if -d $other && !$seen{$other}++;
+    }
+    return @others;
 }
 
 # The common directory of the repository of a checkout whose .git is $dotgit.
@@ -1392,7 +1467,7 @@ sub _git_common_dir {
     my ($dotgit) = @_;
     return Cwd::abs_path($dotgit) if -d $dotgit;
 
-    my ($gitdir) = ( _first_line($dotgit) // q{} ) =~ m/\Agitdir:\s*(.+?)\s*\z/ or return;
+    my ($gitdir) = ( _first_line($dotgit) // q{} ) =~ m/\A gitdir: \s* (.+?) \s* \z/sx or return;
     $gitdir = File::Spec->rel2abs( $gitdir, File::Basename::dirname($dotgit) );
 
     my $common = _first_line( File::Spec->catfile( $gitdir, 'commondir' ) ) // return;
@@ -1427,8 +1502,8 @@ sub _prune_cache {
     my ($cache_dir) = @_;
 
     opendir( my $dh, $cache_dir ) or return;
-    my @names = grep { m/$CACHE_FILE_RX/ } readdir $dh;
-    closedir $dh;
+    my @names = grep { m/$CACHE_FILE_RX/sx } readdir $dh;
+    closedir $dh or return;
 
     foreach my $name (@names) {
         my $file = File::Spec->catfile( $cache_dir, $name );

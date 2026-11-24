@@ -1,4 +1,4 @@
-#!/usr/bin/env perl
+#!perl
 
 package Perl::Tests::Covering::Script;
 
@@ -152,7 +152,7 @@ sub main {
     my @modes = grep { defined $opts{$_} } qw{diff sub by refresh};
     return usage_error('Give one of --diff, --sub, --by and --refresh, not several') if @modes > 1;
     my $mode = $modes[0] // 'files';
-    return usage_error("--$mode takes no files")           if @argv              && grep { $mode eq $_ } qw{diff refresh};
+    return usage_error("--$mode takes no files")           if @argv              && ( $mode eq 'diff' || $mode eq 'refresh' );
     return usage_error('--sub takes exactly one file')     if $mode eq 'sub'     && @argv != 1;
     return usage_error('Give --map or --no-map, not both') if defined $opts{map} && $opts{'no-map'};
 
@@ -171,18 +171,22 @@ sub main {
     my %answer_to = (
         files => sub { $covering->tests_covering(@names) },
         diff  => sub {
-            $covering->tests_covering_diff( do { local $/ = undef; <STDIN> } );
+            $covering->tests_covering_diff( read_all( \*STDIN ) );
         },
         sub => sub { $covering->tests_covering_sub( $names[0], $opts{sub} ) },
         by  => sub {
-            List::Util::uniq( map { $covering->files_covered_by($_) } @names );
+            my @files;
+            foreach my $test (@names) {
+                push @files, $covering->files_covered_by($test);
+            }
+            return List::Util::uniq(@files);
         },
         refresh => sub { $covering->refresh(); () },
     );
 
     my $cwd = Cwd::getcwd();
     foreach my $file ( $answer_to{$mode}->() ) {
-        say File::Spec->abs2rel( File::Spec->catfile( $covering->root(), $file ), $cwd );
+        say File::Spec->abs2rel( File::Spec->catfile( $covering->root(), $file ), $cwd ) or return 1;
     }
     return 0;
 }
@@ -195,7 +199,19 @@ The file names in a handle, one per line, without blank lines.
 
 sub read_names {
     my ($fh) = @_;
-    return grep { length } map { s/\r?\n\z//r } <$fh>;
+    return grep { $_ ne q{} } map { s/\r?\n\z//sxr } <$fh>;
+}
+
+=head2 read_all
+
+Everything in a handle, as one string.
+
+=cut
+
+sub read_all {
+    my ($fh) = @_;
+    local $/ = undef;
+    return scalar <$fh>;
 }
 
 =head2 usage_error
